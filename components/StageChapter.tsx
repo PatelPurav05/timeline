@@ -5,6 +5,7 @@ import type { Id } from "@/convex/_generated/dataModel";
 import { cn } from "@/lib/cn";
 import { motion } from "motion/react";
 import { TimelineCard } from "@/components/TimelineCard";
+import { MediaGallery } from "@/components/MediaGallery";
 import { SourceDrawer } from "@/components/SourceDrawer";
 
 type Stage = {
@@ -56,8 +57,10 @@ export const StageChapter = forwardRef<HTMLElement, StageChapterProps>(
     const quoteCards = cards.filter((c) => c.type === "quote");
     const turningCards = cards.filter((c) => c.type === "turning_point");
     const mediaCards = cards.filter((c) => c.type === "media");
-    const imageCards = cards.filter((c) => c.type === "image");
-    const videoCards = cards.filter((c) => c.type === "video");
+    // Combine images + videos into a single gallery carousel
+    const mediaGalleryItems = cards
+      .filter((c): c is Card & { type: "image" | "video" } => c.type === "image" || c.type === "video")
+      .sort((a, b) => a.order - b.order);
 
     return (
       <section
@@ -141,23 +144,15 @@ export const StageChapter = forwardRef<HTMLElement, StageChapterProps>(
                 delay={(i + 3) * 0.05}
               />
             ))}
-            {imageCards.map((card, i) => (
-              <TimelineCard
-                key={card._id}
-                card={card}
-                delay={(i + 4) * 0.05}
-                className="sm:col-span-2"
-              />
-            ))}
-            {videoCards.map((card, i) => (
-              <TimelineCard
-                key={card._id}
-                card={card}
-                delay={(i + 5) * 0.05}
-                className="sm:col-span-2"
-              />
-            ))}
           </div>
+
+          {/* ── Media Gallery (staggered scroll carousel) ──────── */}
+          {mediaGalleryItems.length > 0 && (
+            <MediaGallery
+              items={mediaGalleryItems}
+              className="mt-8"
+            />
+          )}
 
           {/* ── Action Buttons ────────────────────────── */}
           <div className="mt-6 flex flex-wrap gap-3">

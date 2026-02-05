@@ -13,11 +13,42 @@ function assertEnv() {
   }
 }
 
+/** Retry fetch with exponential backoff for transient failures (502, 503, 429, network errors) */
+async function fetchWithRetry(
+  url: string,
+  init: RequestInit,
+  maxRetries = 3,
+): Promise<Response> {
+  let lastError: Error | null = null;
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      const response = await fetch(url, init);
+      // Retry on transient server errors and rate limits
+      if (
+        (response.status === 429 || response.status === 502 || response.status === 503) &&
+        attempt < maxRetries
+      ) {
+        const delay = Math.min(1000 * Math.pow(2, attempt), 8000);
+        await new Promise((resolve) => setTimeout(resolve, delay));
+        continue;
+      }
+      return response;
+    } catch (err) {
+      lastError = err instanceof Error ? err : new Error(String(err));
+      if (attempt < maxRetries) {
+        const delay = Math.min(1000 * Math.pow(2, attempt), 8000);
+        await new Promise((resolve) => setTimeout(resolve, delay));
+      }
+    }
+  }
+  throw lastError ?? new Error("Request failed after retries");
+}
+
 export const embedText = action({
   args: { text: v.string() },
   handler: async (_ctx, args) => {
     assertEnv();
-    const response = await fetch("https://api.openai.com/v1/embeddings", {
+    const response = await fetchWithRetry("https://api.openai.com/v1/embeddings", {
       method: "POST",
       headers: {
         Authorization: `Bearer ${OPENAI_API_KEY}`,
@@ -49,7 +80,7 @@ export const generateStructuredJson = action({
   },
   handler: async (_ctx, args) => {
     assertEnv();
-    const response = await fetch("https://api.openai.com/v1/chat/completions", {
+    const response = await fetchWithRetry("https://api.openai.com/v1/chat/completions", {
       method: "POST",
       headers: {
         Authorization: `Bearer ${OPENAI_API_KEY}`,
@@ -86,7 +117,7 @@ export const generateChatReply = action({
   },
   handler: async (_ctx, args) => {
     assertEnv();
-    const response = await fetch("https://api.openai.com/v1/chat/completions", {
+    const response = await fetchWithRetry("https://api.openai.com/v1/chat/completions", {
       method: "POST",
       headers: {
         Authorization: `Bearer ${OPENAI_API_KEY}`,

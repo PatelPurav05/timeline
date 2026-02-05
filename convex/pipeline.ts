@@ -195,7 +195,7 @@ function fallbackDiscovery(name: string): CandidateSource[] {
   return items.map((source) => ({ ...source, url: source.url.replace("{slug}", slug) }));
 }
 
-async function extractSource(source: CandidateSource): Promise<{ text: string; imageUrls: string[] }> {
+async function extractSource(source: CandidateSource, personName?: string): Promise<{ text: string; imageUrls: string[] }> {
   if (source.url.includes("youtube.com/results")) {
     return {
       text: `${source.title}\n${source.snippet ?? ""}\nThis is a search index URL and should be treated as metadata-only evidence.`,
@@ -216,7 +216,7 @@ async function extractSource(source: CandidateSource): Promise<{ text: string; i
       };
     }
     const html = await response.text();
-    const imageUrls = extractImageUrls(html, source.url);
+    const imageUrls = extractImageUrls(html, source.url, personName);
     const plain = stripHtml(html);
     return { text: plain.slice(0, 20000), imageUrls };
   } catch (_error) {
@@ -227,25 +227,59 @@ async function extractSource(source: CandidateSource): Promise<{ text: string; i
   }
 }
 
-/** Extract significant image URLs from HTML, filtering out icons/tracking pixels */
-function extractImageUrls(html: string, baseUrl: string): string[] {
-  const imgRegex = /<img[^>]+src=["']([^"']+)["'][^>]*>/gi;
+/**
+ * Extract image URLs from HTML that are likely related to the person.
+ * Filters by alt text relevance, size, and excludes generic site chrome.
+ */
+function extractImageUrls(html: string, baseUrl: string, personName?: string): string[] {
+  const imgRegex = /<img[^>]*>/gi;
   const urls: string[] = [];
+  const nameParts = (personName ?? "").toLowerCase().split(/\s+/).filter(Boolean);
   let match: RegExpExecArray | null;
-  while ((match = imgRegex.exec(html)) !== null) {
-    const src = match[1];
-    if (!src) continue;
 
-    // Skip data URIs, tiny tracking pixels, icons, and SVGs
+  while ((match = imgRegex.exec(html)) !== null) {
+    const fullTag = match[0];
+
+    // Extract src
+    const srcMatch = fullTag.match(/src=["']([^"']+)["']/i);
+    if (!srcMatch?.[1]) continue;
+    const src = srcMatch[1];
+
+    // Skip data URIs, tiny tracking pixels, icons, SVGs, and generic site assets
     if (src.startsWith("data:")) continue;
     if (src.includes("1x1") || src.includes("pixel") || src.includes("tracking")) continue;
     if (src.endsWith(".svg") || src.includes("/icon")) continue;
-    if (src.includes("logo") || src.includes("favicon")) continue;
+    if (src.includes("logo") || src.includes("favicon") || src.includes("avatar")) continue;
+    if (src.includes("banner") || src.includes("ad-") || src.includes("sprite")) continue;
+    if (src.includes("button") || src.includes("arrow") || src.includes("widget")) continue;
 
-    // Check for size hints in the tag — skip small images
-    const fullTag = match[0];
+    // Check for size hints — skip small images (icons, thumbnails under 150px)
     const widthMatch = fullTag.match(/width=["']?(\d+)/i);
-    if (widthMatch && parseInt(widthMatch[1]) < 100) continue;
+    if (widthMatch && parseInt(widthMatch[1]) < 150) continue;
+    const heightMatch = fullTag.match(/height=["']?(\d+)/i);
+    if (heightMatch && parseInt(heightMatch[1]) < 100) continue;
+
+    // Check if the image is likely related to the person via alt text or surrounding context
+    const altMatch = fullTag.match(/alt=["']([^"']*)["']/i);
+    const altText = (altMatch?.[1] ?? "").toLowerCase();
+
+    // Score relevance: person name in alt text is a strong signal
+    let relevant = false;
+    if (nameParts.length > 0) {
+      const nameInAlt = nameParts.some((part) => altText.includes(part));
+      const nameInSrc = nameParts.some((part) => src.toLowerCase().includes(part));
+      relevant = nameInAlt || nameInSrc;
+    }
+
+    // Also accept images from known photo/media patterns if no name filter
+    if (!relevant && nameParts.length > 0) {
+      // Skip generic images that don't reference the person at all
+      // Only allow if it's from a known person-photo pattern
+      const isPhotoPattern = src.includes("photo") || src.includes("portrait") ||
+        src.includes("headshot") || src.includes("profile") ||
+        altText.includes("photo") || altText.includes("portrait");
+      if (!isPhotoPattern) continue;
+    }
 
     // Resolve relative URLs
     let absoluteUrl = src;
@@ -264,8 +298,55 @@ function extractImageUrls(html: string, baseUrl: string): string[] {
 
     urls.push(absoluteUrl);
   }
-  // Return up to 5 unique images
-  return [...new Set(urls)].slice(0, 5);
+  // Return up to 4 unique, relevant images
+  return [...new Set(urls)].slice(0, 4);
+}
+
+/**
+ * Search for actual images of a person using Exa with image-focused queries.
+ * Returns high-quality image URLs that are actually of the person.
+ */
+async function searchPersonImages(name: string, stageTitle?: string): Promise<string[]> {
+  if (!EXA_API_KEY) return [];
+
+  const query = stageTitle
+    ? `${name} photo ${stageTitle.replace(/^\[.*?\]\s*-\s*/, "")}`
+    : `${name} photo portrait`;
+
+  try {
+    const response = await fetch("https://api.exa.ai/search", {
+      method: "POST",
+      headers: {
+        "x-api-key": EXA_API_KEY,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        query,
+        numResults: 5,
+        type: "auto",
+        text: false,
+      }),
+    });
+    if (!response.ok) return [];
+
+    const data = (await response.json()) as {
+      results?: Array<{
+        url: string;
+        image?: string;
+      }>;
+    };
+
+    const images: string[] = [];
+    for (const result of data.results ?? []) {
+      // Exa may return an `image` field with a direct image URL
+      if (result.image && result.image.startsWith("http")) {
+        images.push(result.image);
+      }
+    }
+    return [...new Set(images)].slice(0, 3);
+  } catch {
+    return [];
+  }
 }
 
 /** Extract YouTube video ID from various URL formats */
@@ -460,7 +541,7 @@ export const runIngestion = action({
           title: source.title,
           type: source.type,
           publishedAt: source.publishedAt,
-        });
+        }, person.name);
         await ctx.runMutation(internal.pipeline.updateSourceText, {
           sourceId: source._id,
           rawText: extracted.text,
@@ -626,7 +707,7 @@ export const runIngestion = action({
               title: source.title,
               type: source.type,
               publishedAt: source.publishedAt,
-            });
+            }, person.name);
             await ctx.runMutation(internal.pipeline.updateSourceText, {
               sourceId: source._id,
               rawText: extracted.text,
@@ -716,8 +797,21 @@ export const runIngestion = action({
         progress: 20,
       });
 
+      // Search for actual person images per stage via Exa
+      const personImagesByStage: Record<string, string[]> = {};
+      const refreshedStages: StageDoc[] = await ctx.runQuery(internal.pipeline.listStagesInternal, {
+        personId: args.personId,
+      });
+      for (const stage of refreshedStages) {
+        const images = await searchPersonImages(person.name, stage.title);
+        if (images.length > 0) {
+          personImagesByStage[String(stage._id)] = images;
+        }
+      }
+
       await ctx.runMutation(internal.pipeline.replaceTimelineCards, {
         personId: args.personId,
+        personImages: JSON.stringify(personImagesByStage),
       });
 
       await ctx.runMutation(internal.pipeline.upsertJobPhase, {
@@ -1127,8 +1221,15 @@ export const insertChunk = internalMutation({
 });
 
 export const replaceTimelineCards = internalMutation({
-  args: { personId: v.id("persons") },
+  args: {
+    personId: v.id("persons"),
+    personImages: v.optional(v.string()),
+  },
   handler: async (ctx, args) => {
+    const personImagesByStage: Record<string, string[]> = args.personImages
+      ? parseJson<Record<string, string[]>>(args.personImages, {})
+      : {};
+
     const stages = await ctx.db
       .query("stages")
       .withIndex("by_person_order", (q) => q.eq("personId", args.personId))
@@ -1188,16 +1289,32 @@ export const replaceTimelineCards = internalMutation({
         order += 1;
       }
 
-      // ── Image cards from source metadata ──────────
+      // ── Person images from Exa search (high relevance) ──────────
+      const stageKey = String(stage._id);
+      const exaImages = personImagesByStage[stageKey] ?? [];
+      for (const imgUrl of exaImages) {
+        await ctx.db.insert("timelineCards", {
+          stageId: stage._id,
+          type: "image",
+          headline: stage.title,
+          body: imgUrl,
+          mediaRef: imgUrl,
+          order,
+          createdAt: Date.now(),
+        });
+        order += 1;
+      }
+
+      // ── Supplementary images from source HTML (person-filtered) ──────
       const allStageLinks = await ctx.db.query("stageSourceLinks").withIndex("by_stage", (q) => q.eq("stageId", stage._id)).collect();
-      const addedImageUrls = new Set<string>();
+      const addedImageUrls = new Set<string>(exaImages);
       for (const link of allStageLinks) {
         const source = await ctx.db.get(link.sourceId);
         if (!source) continue;
 
         const meta = parseJson<{ imageUrls?: string[] }>(source.metadata, {});
         if (meta.imageUrls && meta.imageUrls.length > 0) {
-          for (const imgUrl of meta.imageUrls.slice(0, 3)) {
+          for (const imgUrl of meta.imageUrls.slice(0, 2)) {
             if (addedImageUrls.has(imgUrl)) continue;
             addedImageUrls.add(imgUrl);
             await ctx.db.insert("timelineCards", {

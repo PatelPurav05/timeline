@@ -194,6 +194,17 @@ a {
   font-size: 0.8125rem;
 }
 
+/* ── Scrollbar Hide ────────────────────────────────── */
+
+.scrollbar-hide {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+
+.scrollbar-hide::-webkit-scrollbar {
+  display: none;
+}
+
 /* ── Source Type Badge ──────────────────────────────── */
 
 .source-badge {
