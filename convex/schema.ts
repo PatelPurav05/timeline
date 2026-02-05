@@ -119,8 +119,11 @@ export default defineSchema({
   chatSessions: defineTable({
     personId: v.id("persons"),
     stageId: v.id("stages"),
+    clientId: v.optional(v.string()),
     createdAt: v.number(),
-  }).index("by_person_stage", ["personId", "stageId"]),
+  })
+    .index("by_person_stage", ["personId", "stageId"])
+    .index("by_person_stage_client", ["personId", "stageId", "clientId"]),
 
   chatMessages: defineTable({
     sessionId: v.id("chatSessions"),

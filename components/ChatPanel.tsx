@@ -6,6 +6,7 @@ import { api } from "@/convex/_generated/api";
 import type { Id } from "@/convex/_generated/dataModel";
 import { cn } from "@/lib/cn";
 import { motion } from "motion/react";
+import { useClientId } from "@/lib/useClientId";
 
 export function ChatPanel({
   personId,
@@ -20,9 +21,11 @@ export function ChatPanel({
   stageTitle: string;
   onClose: () => void;
 }) {
+  const clientId = useClientId();
   const chatData = useQuery(api.persons.getChatSessionMessages, {
     personId,
     stageId,
+    clientId: clientId || undefined,
   });
   const sendChat = useAction(api.persons.sendStageChat);
 
@@ -68,6 +71,7 @@ export function ChatPanel({
           stageId,
           message: text,
           sessionId: sessionId ?? undefined,
+          clientId: clientId || undefined,
         });
       } catch {
         // Error is shown in UI through the failed message state

@@ -196,14 +196,23 @@ export const getChatSessionMessages = query({
   args: {
     personId: v.id("persons"),
     stageId: v.id("stages"),
+    clientId: v.optional(v.string()),
   },
   handler: async (ctx, args) => {
-    const session = await ctx.db
-      .query("chatSessions")
-      .withIndex("by_person_stage", (q) =>
-        q.eq("personId", args.personId).eq("stageId", args.stageId),
-      )
-      .first();
+    // Look up session scoped to this client
+    const session = args.clientId
+      ? await ctx.db
+          .query("chatSessions")
+          .withIndex("by_person_stage_client", (q) =>
+            q.eq("personId", args.personId).eq("stageId", args.stageId).eq("clientId", args.clientId),
+          )
+          .first()
+      : await ctx.db
+          .query("chatSessions")
+          .withIndex("by_person_stage", (q) =>
+            q.eq("personId", args.personId).eq("stageId", args.stageId),
+          )
+          .first();
 
     if (!session) {
       return { sessionId: null, messages: [] as Array<unknown> };
@@ -257,6 +266,7 @@ export const sendStageChat = action({
     stageId: v.id("stages"),
     message: v.string(),
     sessionId: v.optional(v.id("chatSessions")),
+    clientId: v.optional(v.string()),
   },
   handler: async (ctx, args): Promise<ChatResult> => {
     const personResult: { person: { name: string }; jobs: unknown[] } | null =
@@ -279,6 +289,7 @@ export const sendStageChat = action({
         await ctx.runQuery(api.persons.getChatSessionMessages, {
           personId: args.personId,
           stageId: args.stageId,
+          clientId: args.clientId,
         });
       sessionId = existing.sessionId ?? undefined;
     }
@@ -287,6 +298,7 @@ export const sendStageChat = action({
       sessionId = await ctx.runMutation(api.persons.createChatSession, {
         personId: args.personId,
         stageId: args.stageId,
+        clientId: args.clientId,
       });
     }
 
@@ -411,11 +423,13 @@ export const createChatSession = mutation({
   args: {
     personId: v.id("persons"),
     stageId: v.id("stages"),
+    clientId: v.optional(v.string()),
   },
   handler: async (ctx, args) => {
     return ctx.db.insert("chatSessions", {
       personId: args.personId,
       stageId: args.stageId,
+      clientId: args.clientId,
       createdAt: Date.now(),
     });
   },
