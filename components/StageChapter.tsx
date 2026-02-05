@@ -22,7 +22,7 @@ type Stage = {
 
 type Card = {
   _id: Id<"timelineCards">;
-  type: "moment" | "quote" | "media" | "turning_point";
+  type: "moment" | "quote" | "media" | "turning_point" | "image" | "video";
   headline: string;
   body: string;
   mediaRef?: string;
@@ -56,6 +56,8 @@ export const StageChapter = forwardRef<HTMLElement, StageChapterProps>(
     const quoteCards = cards.filter((c) => c.type === "quote");
     const turningCards = cards.filter((c) => c.type === "turning_point");
     const mediaCards = cards.filter((c) => c.type === "media");
+    const imageCards = cards.filter((c) => c.type === "image");
+    const videoCards = cards.filter((c) => c.type === "video");
 
     return (
       <section
@@ -137,6 +139,22 @@ export const StageChapter = forwardRef<HTMLElement, StageChapterProps>(
                 key={card._id}
                 card={card}
                 delay={(i + 3) * 0.05}
+              />
+            ))}
+            {imageCards.map((card, i) => (
+              <TimelineCard
+                key={card._id}
+                card={card}
+                delay={(i + 4) * 0.05}
+                className="sm:col-span-2"
+              />
+            ))}
+            {videoCards.map((card, i) => (
+              <TimelineCard
+                key={card._id}
+                card={card}
+                delay={(i + 5) * 0.05}
+                className="sm:col-span-2"
               />
             ))}
           </div>

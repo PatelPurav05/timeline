@@ -195,9 +195,12 @@ function fallbackDiscovery(name: string): CandidateSource[] {
   return items.map((source) => ({ ...source, url: source.url.replace("{slug}", slug) }));
 }
 
-async function extractSource(source: CandidateSource): Promise<string> {
+async function extractSource(source: CandidateSource): Promise<{ text: string; imageUrls: string[] }> {
   if (source.url.includes("youtube.com/results")) {
-    return `${source.title}\n${source.snippet ?? ""}\nThis is a search index URL and should be treated as metadata-only evidence.`;
+    return {
+      text: `${source.title}\n${source.snippet ?? ""}\nThis is a search index URL and should be treated as metadata-only evidence.`,
+      imageUrls: [],
+    };
   }
 
   try {
@@ -207,13 +210,136 @@ async function extractSource(source: CandidateSource): Promise<string> {
       },
     });
     if (!response.ok) {
-      return `${source.title}\n${source.snippet ?? ""}\nFailed to fetch full content.`;
+      return {
+        text: `${source.title}\n${source.snippet ?? ""}\nFailed to fetch full content.`,
+        imageUrls: [],
+      };
     }
     const html = await response.text();
+    const imageUrls = extractImageUrls(html, source.url);
     const plain = stripHtml(html);
-    return plain.slice(0, 20000);
+    return { text: plain.slice(0, 20000), imageUrls };
   } catch (_error) {
-    return `${source.title}\n${source.snippet ?? ""}\nContent unavailable; using metadata snippet only.`;
+    return {
+      text: `${source.title}\n${source.snippet ?? ""}\nContent unavailable; using metadata snippet only.`,
+      imageUrls: [],
+    };
+  }
+}
+
+/** Extract significant image URLs from HTML, filtering out icons/tracking pixels */
+function extractImageUrls(html: string, baseUrl: string): string[] {
+  const imgRegex = /<img[^>]+src=["']([^"']+)["'][^>]*>/gi;
+  const urls: string[] = [];
+  let match: RegExpExecArray | null;
+  while ((match = imgRegex.exec(html)) !== null) {
+    const src = match[1];
+    if (!src) continue;
+
+    // Skip data URIs, tiny tracking pixels, icons, and SVGs
+    if (src.startsWith("data:")) continue;
+    if (src.includes("1x1") || src.includes("pixel") || src.includes("tracking")) continue;
+    if (src.endsWith(".svg") || src.includes("/icon")) continue;
+    if (src.includes("logo") || src.includes("favicon")) continue;
+
+    // Check for size hints in the tag — skip small images
+    const fullTag = match[0];
+    const widthMatch = fullTag.match(/width=["']?(\d+)/i);
+    if (widthMatch && parseInt(widthMatch[1]) < 100) continue;
+
+    // Resolve relative URLs
+    let absoluteUrl = src;
+    if (src.startsWith("//")) {
+      absoluteUrl = "https:" + src;
+    } else if (src.startsWith("/")) {
+      try {
+        const base = new URL(baseUrl);
+        absoluteUrl = base.origin + src;
+      } catch {
+        continue;
+      }
+    } else if (!src.startsWith("http")) {
+      continue;
+    }
+
+    urls.push(absoluteUrl);
+  }
+  // Return up to 5 unique images
+  return [...new Set(urls)].slice(0, 5);
+}
+
+/** Extract YouTube video ID from various URL formats */
+function extractYoutubeId(url: string): string | null {
+  const patterns = [
+    /youtube\.com\/watch\?v=([a-zA-Z0-9_-]{11})/,
+    /youtu\.be\/([a-zA-Z0-9_-]{11})/,
+    /youtube\.com\/embed\/([a-zA-Z0-9_-]{11})/,
+    /youtube\.com\/v\/([a-zA-Z0-9_-]{11})/,
+  ];
+  for (const pattern of patterns) {
+    const match = url.match(pattern);
+    if (match?.[1]) return match[1];
+  }
+  return null;
+}
+
+/** Deep research per stage using Exa with era-specific queries */
+async function deepResearchStage(
+  name: string,
+  stage: StageDoc,
+): Promise<CandidateSource[]> {
+  if (!EXA_API_KEY) return [];
+
+  // Build era-specific query from stage title and summary
+  const titleParts = stage.title.replace(/^\[.*?\]\s*-\s*/, "");
+  const query = `"${name}" ${titleParts} ${stage.eraSummary.slice(0, 100)}`;
+
+  try {
+    const response = await fetch("https://api.exa.ai/search", {
+      method: "POST",
+      headers: {
+        "x-api-key": EXA_API_KEY,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        query,
+        numResults: 8,
+        type: "auto",
+        text: true,
+        highlights: true,
+      }),
+    });
+
+    if (!response.ok) return [];
+    const data = (await response.json()) as {
+      results?: Array<{
+        url: string;
+        title?: string;
+        publishedDate?: string;
+        text?: string;
+      }>;
+    };
+
+    return (data.results ?? []).map((result) => {
+      const lower = result.url.toLowerCase();
+      const sourceType: CandidateSource["type"] =
+        lower.includes("youtube.com") || lower.includes("youtu.be")
+          ? "video"
+          : lower.includes("twitter.com") || lower.includes("x.com")
+            ? "post"
+            : lower.includes("interview")
+              ? "interview"
+              : "article";
+      return {
+        url: result.url,
+        title: result.title ?? result.url,
+        type: sourceType,
+        publishedAt: result.publishedDate,
+        snippet: result.text?.slice(0, 400),
+      };
+    });
+  } catch {
+    return [];
   }
 }
 
@@ -329,7 +455,7 @@ export const runIngestion = action({
 
       let completed = 0;
       for (const source of sources) {
-        const text = await extractSource({
+        const extracted = await extractSource({
           url: source.url,
           title: source.title,
           type: source.type,
@@ -337,7 +463,8 @@ export const runIngestion = action({
         });
         await ctx.runMutation(internal.pipeline.updateSourceText, {
           sourceId: source._id,
-          rawText: text,
+          rawText: extracted.text,
+          imageUrls: extracted.imageUrls,
         });
         completed += 1;
         await ctx.runMutation(internal.pipeline.upsertJobPhase, {
@@ -471,6 +598,62 @@ export const runIngestion = action({
       await ctx.runMutation(internal.pipeline.upsertJobPhase, {
         personId: args.personId,
         phase: "stage",
+        status: "running",
+        progress: 70,
+      });
+
+      // ── Deep research per stage ──────────────────────
+      for (let si = 0; si < stages.length; si += 1) {
+        const stage = stages[si];
+        const deepSources = await deepResearchStage(person.name, stage);
+        if (deepSources.length > 0) {
+          // Add new sources (avoiding duplicates)
+          await ctx.runMutation(internal.pipeline.addSources, {
+            personId: args.personId,
+            sources: deepSources,
+          });
+
+          // Extract content from new deep sources
+          const newSources: SourceDoc[] = await ctx.runQuery(internal.pipeline.listSourcesInternal, {
+            personId: args.personId,
+          });
+          const deepUrls = new Set(deepSources.map((s) => s.url));
+          const justAdded = newSources.filter((s: SourceDoc) => deepUrls.has(s.url) && !s.rawText);
+
+          for (const source of justAdded) {
+            const extracted = await extractSource({
+              url: source.url,
+              title: source.title,
+              type: source.type,
+              publishedAt: source.publishedAt,
+            });
+            await ctx.runMutation(internal.pipeline.updateSourceText, {
+              sourceId: source._id,
+              rawText: extracted.text,
+              imageUrls: extracted.imageUrls,
+            });
+
+            // Link to this stage directly
+            await ctx.runMutation(internal.pipeline.linkSourceToStage, {
+              stageId: stage._id,
+              sourceId: source._id,
+              relevance: 0.85,
+              rationale: "Deep research: stage-targeted Exa discovery",
+            });
+          }
+        }
+
+        await ctx.runMutation(internal.pipeline.upsertJobPhase, {
+          personId: args.personId,
+          phase: "stage",
+          status: "running",
+          progress: 70 + Math.round(((si + 1) / stages.length) * 30),
+        });
+      }
+
+      await ctx.runMutation(internal.pipeline.upsertJobPhase, {
+        personId: args.personId,
+        phase: "stage",
         status: "done",
         progress: 100,
       });
@@ -486,12 +669,17 @@ export const runIngestion = action({
         personId: args.personId,
       });
 
+      // Re-fetch all sources including deep research ones
+      const allSources: SourceDoc[] = await ctx.runQuery(internal.pipeline.listSourcesInternal, {
+        personId: args.personId,
+      });
+
       const stageLinks: StageLinkEntry[] = await ctx.runQuery(internal.pipeline.listStageLinksForPerson, {
         personId: args.personId,
       });
 
       let embedded = 0;
-      for (const source of sourcesWithText) {
+      for (const source of allSources) {
         const stageLink = stageLinks.find((link: StageLinkEntry) => link.sourceId === source._id);
         const text = source.rawText ?? source.transcriptText ?? "";
         const chunks = splitChunks(text);
@@ -768,12 +956,63 @@ export const updateSourceText = internalMutation({
   args: {
     sourceId: v.id("sources"),
     rawText: v.string(),
+    imageUrls: v.optional(v.array(v.string())),
   },
   handler: async (ctx, args) => {
+    const existing = await ctx.db.get(args.sourceId);
+    const prevMeta = existing?.metadata ? parseJson<Record<string, unknown>>(existing.metadata, {}) : {};
+    const newMeta = {
+      ...prevMeta,
+      ...(args.imageUrls && args.imageUrls.length > 0 ? { imageUrls: args.imageUrls } : {}),
+    };
     await ctx.db.patch(args.sourceId, {
       rawText: args.rawText,
       qualityScore: args.rawText.length > 800 ? 0.88 : 0.55,
+      metadata: JSON.stringify(newMeta),
     });
+  },
+});
+
+export const addSources = internalMutation({
+  args: {
+    personId: v.id("persons"),
+    sources: v.array(
+      v.object({
+        url: v.string(),
+        title: v.string(),
+        type: v.union(
+          v.literal("article"),
+          v.literal("video"),
+          v.literal("post"),
+          v.literal("interview"),
+          v.literal("other"),
+        ),
+        publishedAt: v.optional(v.string()),
+        snippet: v.optional(v.string()),
+      }),
+    ),
+  },
+  handler: async (ctx, args) => {
+    // Get existing URLs to avoid duplicates
+    const existing = await ctx.db
+      .query("sources")
+      .withIndex("by_person", (q) => q.eq("personId", args.personId))
+      .collect();
+    const existingUrls = new Set(existing.map((s) => s.url));
+
+    for (const source of args.sources) {
+      if (existingUrls.has(source.url)) continue;
+      await ctx.db.insert("sources", {
+        personId: args.personId,
+        url: source.url,
+        title: source.title,
+        type: source.type,
+        publishedAt: source.publishedAt,
+        metadata: JSON.stringify({ snippet: source.snippet ?? "", deepResearch: true }),
+        qualityScore: source.snippet ? 0.7 : 0.45,
+        createdAt: Date.now(),
+      });
+    }
   },
 });
 
@@ -947,6 +1186,48 @@ export const replaceTimelineCards = internalMutation({
           createdAt: Date.now(),
         });
         order += 1;
+      }
+
+      // ── Image cards from source metadata ──────────
+      const allStageLinks = await ctx.db.query("stageSourceLinks").withIndex("by_stage", (q) => q.eq("stageId", stage._id)).collect();
+      const addedImageUrls = new Set<string>();
+      for (const link of allStageLinks) {
+        const source = await ctx.db.get(link.sourceId);
+        if (!source) continue;
+
+        const meta = parseJson<{ imageUrls?: string[] }>(source.metadata, {});
+        if (meta.imageUrls && meta.imageUrls.length > 0) {
+          for (const imgUrl of meta.imageUrls.slice(0, 3)) {
+            if (addedImageUrls.has(imgUrl)) continue;
+            addedImageUrls.add(imgUrl);
+            await ctx.db.insert("timelineCards", {
+              stageId: stage._id,
+              type: "image",
+              headline: source.title,
+              body: imgUrl,
+              mediaRef: imgUrl,
+              order,
+              createdAt: Date.now(),
+            });
+            order += 1;
+          }
+        }
+
+        // ── Video cards from YouTube URLs ──────────
+        const ytId = extractYoutubeId(source.url);
+        if (ytId) {
+          const embedUrl = `https://www.youtube-nocookie.com/embed/${ytId}`;
+          await ctx.db.insert("timelineCards", {
+            stageId: stage._id,
+            type: "video",
+            headline: source.title,
+            body: embedUrl,
+            mediaRef: source.url,
+            order,
+            createdAt: Date.now(),
+          });
+          order += 1;
+        }
       }
     }
   },

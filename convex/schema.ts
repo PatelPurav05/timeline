@@ -106,6 +106,8 @@ export default defineSchema({
       v.literal("quote"),
       v.literal("media"),
       v.literal("turning_point"),
+      v.literal("image"),
+      v.literal("video"),
     ),
     headline: v.string(),
     body: v.string(),

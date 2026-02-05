@@ -26,7 +26,7 @@ type TimelineStage = {
 
 type TimelineCard = {
   _id: Id<"timelineCards">;
-  type: "moment" | "quote" | "media" | "turning_point";
+  type: "moment" | "quote" | "media" | "turning_point" | "image" | "video";
   headline: string;
   body: string;
   mediaRef?: string;

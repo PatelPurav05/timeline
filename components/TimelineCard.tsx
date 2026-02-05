@@ -6,7 +6,7 @@ import { motion } from "motion/react";
 
 type Card = {
   _id: Id<"timelineCards">;
-  type: "moment" | "quote" | "media" | "turning_point";
+  type: "moment" | "quote" | "media" | "turning_point" | "image" | "video";
   headline: string;
   body: string;
   mediaRef?: string;
@@ -34,6 +34,8 @@ export function TimelineCard({
       {card.type === "quote" && <QuoteCard card={card} />}
       {card.type === "turning_point" && <TurningPointCard card={card} />}
       {card.type === "media" && <MediaCard card={card} />}
+      {card.type === "image" && <ImageCard card={card} />}
+      {card.type === "video" && <VideoCard card={card} />}
     </motion.div>
   );
 }
@@ -141,6 +143,65 @@ function MediaCard({ card }: { card: Card }) {
           <p className="mt-1 line-clamp-2 text-xs text-[var(--muted)]">
             {card.body}
           </p>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function ImageCard({ card }: { card: Card }) {
+  const imgUrl = card.mediaRef ?? card.body;
+
+  return (
+    <div className="comic-panel overflow-hidden p-0">
+      {/* eslint-disable-next-line @next/next/no-img-element */}
+      <img
+        src={imgUrl}
+        alt={card.headline}
+        loading="lazy"
+        className="aspect-video w-full object-cover"
+        onError={(e) => {
+          // Hide broken images gracefully
+          (e.target as HTMLImageElement).style.display = "none";
+        }}
+      />
+      <div className="px-4 py-3">
+        <p className="text-pretty text-sm font-semibold leading-snug">
+          {card.headline}
+        </p>
+      </div>
+    </div>
+  );
+}
+
+function VideoCard({ card }: { card: Card }) {
+  const embedUrl = card.body;
+
+  return (
+    <div className="comic-panel overflow-hidden p-0">
+      <div className="relative aspect-video w-full">
+        <iframe
+          src={embedUrl}
+          title={card.headline}
+          loading="lazy"
+          allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
+          allowFullScreen
+          className="absolute inset-0 h-full w-full"
+        />
+      </div>
+      <div className="px-4 py-3">
+        <p className="text-pretty text-sm font-semibold leading-snug">
+          {card.headline}
+        </p>
+        {card.mediaRef && (
+          <a
+            href={card.mediaRef}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="mt-1 block truncate text-xs text-[var(--accent)] underline"
+          >
+            Watch on YouTube
+          </a>
         )}
       </div>
     </div>

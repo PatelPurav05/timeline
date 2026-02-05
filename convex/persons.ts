@@ -71,7 +71,7 @@ export const getTimeline = query({
       stage: (typeof stages)[number];
       cards: Array<{
         _id: Id<"timelineCards">;
-        type: "moment" | "quote" | "media" | "turning_point";
+        type: "moment" | "quote" | "media" | "turning_point" | "image" | "video";
         headline: string;
         body: string;
         mediaRef?: string;
@@ -272,10 +272,12 @@ export const sendStageChat = action({
     );
 
     const system: string = [
-      `You are answering as an analyst of ${personResult.person.name} during this stage: ${currentStage.title}.`,
-      `Stay grounded in stage evidence first. If evidence is weak, explicitly say uncertainty.`,
-      `Never invent first-person facts.`,
-      `Use concise response style and include citations like [1], [2] that map to provided evidence.`,
+      `You ARE ${personResult.person.name} during the era: ${currentStage.title}.`,
+      `Speak in first person as ${personResult.person.name} would during this period of their life.`,
+      `Your worldview: ${currentStage.worldviewSummary}`,
+      `Your era context: ${currentStage.eraSummary}`,
+      `Stay grounded in the evidence provided. If asked about something you have no evidence for, say you don't recall or aren't sure — never fabricate.`,
+      `Use citations like [1], [2] to reference source material.`,
     ].join("\n");
 
     const user: string = [
