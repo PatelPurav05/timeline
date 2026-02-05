@@ -69,10 +69,10 @@ export const StageChapter = forwardRef<HTMLElement, StageChapterProps>(
         aria-label={stage.title}
         className="relative pb-16 pt-8"
       >
-        {/* Spine dot */}
+        {/* Spine dot — aligned with the age badge on the timeline spine */}
         <div
           className={cn(
-            "spine-dot top-10",
+            "spine-dot top-[2.35rem]",
             isActive && "spine-dot--active",
           )}
         />

@@ -67,7 +67,9 @@ a {
 
 .spine-dot {
   position: absolute;
-  left: calc(1.25rem - 6px);
+  /* pl-12 = 3rem; spine line at 1.25rem from .timeline-spine → dot center at 1.25rem,
+     but we're inside a child with pl-12, so offset = 1.25rem - 3rem = -1.75rem, minus half dot width */
+  left: calc(-3rem + 1.25rem - 7px);
   width: 15px;
   height: 15px;
   border-radius: 50%;
@@ -82,7 +84,8 @@ a {
 
 @media (min-width: 1024px) {
   .spine-dot {
-    left: calc(2rem - 6px);
+    /* pl-16 = 4rem; spine line at 2rem from .timeline-spine */
+    left: calc(-4rem + 2rem - 7px);
   }
 }
 

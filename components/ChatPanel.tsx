@@ -224,10 +224,16 @@ function ChatMessage({
   };
 }) {
   const isUser = message.role === "user";
+  const [sourcesOpen, setSourcesOpen] = useState(false);
+
+  const parsedCitations = message.citations.map((cite) => {
+    const parts = cite.split(" — ");
+    return { title: parts[0] ?? "Source", url: parts[1] ?? "" };
+  });
 
   return (
     <div className={cn("flex", isUser ? "justify-end" : "justify-start")}>
-      <div className="max-w-[85%] space-y-2">
+      <div className="max-w-[85%] space-y-1.5">
         <div
           className={cn(
             "speech-bubble",
@@ -247,14 +253,90 @@ function ChatMessage({
           </div>
         )}
 
-        {/* Citations */}
-        {!isUser && message.citations.length > 0 && (
-          <div className="flex flex-wrap gap-1.5 px-1">
-            {message.citations.map((cite, i) => (
-              <span key={i} className="source-badge">
-                [{i + 1}] {cite.split(" — ")[0]}
-              </span>
-            ))}
+        {/* Sources toggle + expandable links */}
+        {!isUser && parsedCitations.length > 0 && (
+          <div className="relative pl-1">
+            <button
+              onClick={() => setSourcesOpen((prev) => !prev)}
+              className={cn(
+                "flex items-center gap-1.5 rounded-lg px-2.5 py-1 text-xs font-medium transition",
+                sourcesOpen
+                  ? "bg-[var(--frame)] text-white"
+                  : "text-[var(--muted)] hover:bg-[var(--panel)] hover:text-[var(--ink)]",
+              )}
+            >
+              <svg width="12" height="12" viewBox="0 0 12 12" fill="none" aria-hidden="true">
+                <path d="M2 3H10M2 6H7M2 9H9" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+              </svg>
+              {parsedCitations.length} source{parsedCitations.length !== 1 ? "s" : ""}
+              <svg
+                width="10"
+                height="10"
+                viewBox="0 0 10 10"
+                fill="none"
+                aria-hidden="true"
+                className={cn(
+                  "transition-transform",
+                  sourcesOpen && "rotate-180",
+                )}
+              >
+                <path d="M2 4L5 7L8 4" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+              </svg>
+            </button>
+
+            {sourcesOpen && (
+              <motion.div
+                initial={{ opacity: 0, height: 0 }}
+                animate={{ opacity: 1, height: "auto" }}
+                exit={{ opacity: 0, height: 0 }}
+                transition={{ duration: 0.15, ease: "easeOut" }}
+                className="mt-1.5 overflow-hidden rounded-lg border-2 border-[var(--frame)] bg-white"
+              >
+                {parsedCitations.map((cite, i) => (
+                  <div
+                    key={i}
+                    className={cn(
+                      "flex items-start gap-2.5 px-3 py-2",
+                      i > 0 && "border-t border-[var(--frame)]/20",
+                    )}
+                  >
+                    <span className="mt-0.5 flex size-5 shrink-0 items-center justify-center rounded-full bg-[var(--paper)] text-[10px] font-bold text-[var(--ink)]">
+                      {i + 1}
+                    </span>
+                    <div className="min-w-0 flex-1">
+                      <p className="truncate text-xs font-medium leading-snug">
+                        {cite.title}
+                      </p>
+                      {cite.url && (
+                        <a
+                          href={cite.url}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="mt-0.5 block truncate text-[11px] text-[var(--accent)] underline decoration-[var(--accent)]/40 hover:decoration-[var(--accent)]"
+                        >
+                          {cite.url}
+                        </a>
+                      )}
+                    </div>
+                    {cite.url && (
+                      <a
+                        href={cite.url}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        aria-label={`Open ${cite.title}`}
+                        className="mt-0.5 flex size-5 shrink-0 items-center justify-center rounded text-[var(--muted)] transition hover:text-[var(--accent)]"
+                      >
+                        <svg width="10" height="10" viewBox="0 0 10 10" fill="none" aria-hidden="true">
+                          <path d="M4 1H9V6" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+                          <path d="M9 1L4 6" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+                          <path d="M7 6V9H1V3H4" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+                        </svg>
+                      </a>
+                    )}
+                  </div>
+                ))}
+              </motion.div>
+            )}
           </div>
         )}
       </div>
