@@ -35,7 +35,14 @@ export function ChatPanel({
   const panelRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
 
-  const messages = chatData?.messages ?? [];
+  const messages: {
+    _id: string;
+    role: "user" | "assistant";
+    content: string;
+    citations: string[];
+    usedFallback: boolean;
+    createdAt: number;
+  }[] = (chatData?.messages as typeof messages) ?? [];
   const sessionId = chatData?.sessionId as Id<"chatSessions"> | null;
 
   // Scroll to bottom on new messages
