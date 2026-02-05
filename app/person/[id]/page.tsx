@@ -36,7 +36,7 @@ export default function PersonPage({
             href="/"
             className="mt-6 inline-block rounded-xl border-2 border-[var(--frame)] bg-[var(--accent)] px-5 py-2.5 font-semibold text-white transition hover:translate-y-[-1px]"
           >
-            Back to Atlas
+            Back to LORE
           </Link>
         </div>
       </main>
@@ -74,7 +74,7 @@ export default function PersonPage({
                 strokeLinejoin="round"
               />
             </svg>
-            Atlas
+            LORE
           </Link>
           <div className="h-5 w-px bg-[var(--frame)] opacity-30" />
           <h1 className="truncate text-lg font-semibold">{person.name}</h1>
