@@ -10,12 +10,18 @@ import { motion } from "motion/react";
 export default function HomePage() {
   const router = useRouter();
   const createPerson = useMutation(api.persons.createPerson);
-  const people = useQuery(api.persons.listRecentPersons, { limit: 12 }) ?? [];
+  const people = useQuery(api.persons.listRecentPersons, { limit: 50 }) ?? [];
   const [name, setName] = useState("");
+  const [search, setSearch] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const featured = useMemo(() => people.slice(0, 5), [people]);
+  // Filter people by search query (case-insensitive)
+  const filtered = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    if (!q) return people.slice(0, 8);
+    return people.filter((p) => p.name.toLowerCase().includes(q));
+  }, [people, search]);
 
   const onSubmit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -32,6 +38,16 @@ export default function HomePage() {
       setSubmitting(false);
     }
   };
+
+  // When typing in the main input, also update search to show matches
+  const handleNameChange = (value: string) => {
+    setName(value);
+    setSearch(value);
+  };
+
+  // Check if input matches an existing person
+  const inputLower = name.trim().toLowerCase();
+  const matchedPerson = people.find((p) => p.name.toLowerCase() === inputLower);
 
   return (
     <main className="min-h-dvh px-5 py-8 sm:px-8 lg:px-12">
@@ -58,7 +74,7 @@ export default function HomePage() {
             <input
               id="person-name"
               value={name}
-              onChange={(event) => setName(event.target.value)}
+              onChange={(event) => handleNameChange(event.target.value)}
               placeholder="Sam Altman"
               className="h-12 rounded-xl border-2 border-[var(--frame)] bg-white px-4 text-base outline-none transition focus:border-[var(--accent)]"
             />
@@ -67,9 +83,21 @@ export default function HomePage() {
               disabled={submitting}
               className="h-12 rounded-xl border-2 border-[var(--frame)] bg-[var(--accent)] px-5 font-semibold text-white transition hover:translate-y-[-1px] disabled:cursor-not-allowed disabled:opacity-50"
             >
-              {submitting ? "Building timeline..." : "Generate Timeline"}
+              {submitting
+                ? "Building timeline..."
+                : matchedPerson
+                  ? "View Timeline"
+                  : "Generate Timeline"}
             </button>
           </form>
+
+          {/* Inline match hint */}
+          {matchedPerson && !submitting && (
+            <p className="mt-2 text-sm text-[var(--success)]">
+              Timeline already exists for {matchedPerson.name} — click to view it.
+            </p>
+          )}
+
           {error ? <p className="mt-2 text-sm text-red-700">{error}</p> : null}
         </motion.div>
 
@@ -79,12 +107,40 @@ export default function HomePage() {
           transition={{ duration: 0.35, ease: "easeOut", delay: 0.07 }}
           className="rounded-3xl border-4 border-[var(--frame)] bg-white p-5 shadow-[8px_8px_0_0_var(--frame)]"
         >
-          <h2 className="text-balance text-4xl">Recent Subjects</h2>
-          <div className="mt-4 space-y-3">
-            {featured.length === 0 ? (
-              <p className="text-pretty text-sm">No timelines yet. Create one to start the archive.</p>
+          <h2 className="text-balance text-4xl">
+            {search.trim() ? "Search Results" : "Recent Subjects"}
+          </h2>
+
+          {/* Search input */}
+          <div className="relative mt-3">
+            <svg
+              width="14"
+              height="14"
+              viewBox="0 0 14 14"
+              fill="none"
+              aria-hidden="true"
+              className="absolute left-3.5 top-1/2 -translate-y-1/2 text-[var(--muted)]"
+            >
+              <circle cx="6" cy="6" r="4.5" stroke="currentColor" strokeWidth="1.5" />
+              <path d="M10 10L13 13" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+            </svg>
+            <input
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              placeholder="Search subjects..."
+              className="h-10 w-full rounded-lg border-2 border-[var(--frame)] bg-[var(--paper)] pl-9 pr-3 text-sm outline-none transition focus:border-[var(--accent)]"
+            />
+          </div>
+
+          <div className="mt-3 space-y-2">
+            {filtered.length === 0 ? (
+              <p className="py-4 text-center text-pretty text-sm text-[var(--muted)]">
+                {search.trim()
+                  ? "No subjects match your search."
+                  : "No timelines yet. Create one to start the archive."}
+              </p>
             ) : (
-              featured.map((person) => (
+              filtered.map((person) => (
                 <Link
                   key={person._id}
                   href={`/person/${person._id}`}
@@ -92,7 +148,15 @@ export default function HomePage() {
                 >
                   <div className="flex items-center justify-between gap-3">
                     <p className="font-semibold">{person.name}</p>
-                    <span className="rounded-full border border-[var(--frame)] px-2 py-0.5 text-xs uppercase">
+                    <span
+                      className={`rounded-full border px-2 py-0.5 text-xs uppercase ${
+                        person.status === "ready"
+                          ? "border-[var(--success)] text-[var(--success)]"
+                          : person.status === "failed"
+                            ? "border-red-400 text-red-500"
+                            : "border-[var(--frame)] text-[var(--ink)]"
+                      }`}
+                    >
                       {person.status}
                     </span>
                   </div>

@@ -195,11 +195,25 @@ function fallbackDiscovery(name: string): CandidateSource[] {
   return items.map((source) => ({ ...source, url: source.url.replace("{slug}", slug) }));
 }
 
-async function extractSource(source: CandidateSource, personName?: string): Promise<{ text: string; imageUrls: string[] }> {
+async function extractSource(
+  source: CandidateSource,
+  personName?: string,
+): Promise<{ text: string; imageUrls: string[]; transcriptText?: string }> {
   if (source.url.includes("youtube.com/results")) {
     return {
       text: `${source.title}\n${source.snippet ?? ""}\nThis is a search index URL and should be treated as metadata-only evidence.`,
       imageUrls: [],
+    };
+  }
+
+  // Handle YouTube videos — fetch transcript
+  const ytId = extractYoutubeId(source.url);
+  if (ytId) {
+    const transcript = await fetchYoutubeTranscript(ytId);
+    return {
+      text: `${source.title}\n${source.snippet ?? ""}\nYouTube video.`,
+      imageUrls: [],
+      transcriptText: transcript || undefined,
     };
   }
 
@@ -364,17 +378,100 @@ function extractYoutubeId(url: string): string | null {
   return null;
 }
 
-/** Deep research per stage using Exa with era-specific queries */
+/**
+ * Fetch YouTube video transcript/captions.
+ * Uses YouTube's internal timedtext API to get auto-generated captions.
+ * Falls back gracefully if no captions are available.
+ */
+async function fetchYoutubeTranscript(videoId: string): Promise<string> {
+  try {
+    // Step 1: Fetch the video page to extract caption track info
+    const pageResponse = await fetch(`https://www.youtube.com/watch?v=${videoId}`, {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.9",
+      },
+    });
+
+    if (!pageResponse.ok) return "";
+    const pageHtml = await pageResponse.text();
+
+    // Extract the captions JSON from the page source
+    const captionMatch = pageHtml.match(/"captionTracks":\s*(\[.*?\])/);
+    if (!captionMatch?.[1]) return "";
+
+    let captionTracks: Array<{ baseUrl?: string; languageCode?: string }>;
+    try {
+      captionTracks = JSON.parse(captionMatch[1]);
+    } catch {
+      return "";
+    }
+
+    // Prefer English, fall back to first available
+    const englishTrack = captionTracks.find((t) => t.languageCode === "en" || t.languageCode?.startsWith("en"));
+    const track = englishTrack ?? captionTracks[0];
+    if (!track?.baseUrl) return "";
+
+    // Step 2: Fetch the actual transcript XML
+    const captionUrl = track.baseUrl + "&fmt=srv3";
+    const captionResponse = await fetch(captionUrl);
+    if (!captionResponse.ok) return "";
+    const captionXml = await captionResponse.text();
+
+    // Parse the XML to extract text content
+    const textSegments: string[] = [];
+    const segmentRegex = /<p[^>]*>(.*?)<\/p>/gi;
+    let match: RegExpExecArray | null;
+    while ((match = segmentRegex.exec(captionXml)) !== null) {
+      const text = match[1]
+        .replace(/<[^>]+>/g, "") // Strip nested tags
+        .replace(/&amp;/g, "&")
+        .replace(/&lt;/g, "<")
+        .replace(/&gt;/g, ">")
+        .replace(/&quot;/g, '"')
+        .replace(/&#39;/g, "'")
+        .replace(/\s+/g, " ")
+        .trim();
+      if (text) textSegments.push(text);
+    }
+
+    // If srv3 format didn't work, try the simpler timedtext format
+    if (textSegments.length === 0) {
+      const simpleRegex = /<text[^>]*>(.*?)<\/text>/gi;
+      while ((match = simpleRegex.exec(captionXml)) !== null) {
+        const text = match[1]
+          .replace(/<[^>]+>/g, "")
+          .replace(/&amp;/g, "&")
+          .replace(/&lt;/g, "<")
+          .replace(/&gt;/g, ">")
+          .replace(/&quot;/g, '"')
+          .replace(/&#39;/g, "'")
+          .replace(/\s+/g, " ")
+          .trim();
+        if (text) textSegments.push(text);
+      }
+    }
+
+    const transcript = textSegments.join(" ").trim();
+    // Cap at 30k chars to keep things manageable
+    return transcript.slice(0, 30000);
+  } catch {
+    return "";
+  }
+}
+
+/** Deep research per stage using Exa — articles + YouTube videos */
 async function deepResearchStage(
   name: string,
   stage: StageDoc,
 ): Promise<CandidateSource[]> {
   if (!EXA_API_KEY) return [];
 
-  // Build era-specific query from stage title and summary
   const titleParts = stage.title.replace(/^\[.*?\]\s*-\s*/, "");
-  const query = `"${name}" ${titleParts} ${stage.eraSummary.slice(0, 100)}`;
+  const allResults: CandidateSource[] = [];
 
+  // ── Search 1: Articles & interviews ──────────
+  const articleQuery = `"${name}" ${titleParts} ${stage.eraSummary.slice(0, 100)}`;
   try {
     const response = await fetch("https://api.exa.ai/search", {
       method: "POST",
@@ -383,45 +480,95 @@ async function deepResearchStage(
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        query,
-        numResults: 8,
+        query: articleQuery,
+        numResults: 6,
         type: "auto",
         text: true,
         highlights: true,
       }),
     });
 
-    if (!response.ok) return [];
-    const data = (await response.json()) as {
-      results?: Array<{
-        url: string;
-        title?: string;
-        publishedDate?: string;
-        text?: string;
-      }>;
-    };
-
-    return (data.results ?? []).map((result) => {
-      const lower = result.url.toLowerCase();
-      const sourceType: CandidateSource["type"] =
-        lower.includes("youtube.com") || lower.includes("youtu.be")
-          ? "video"
-          : lower.includes("twitter.com") || lower.includes("x.com")
-            ? "post"
-            : lower.includes("interview")
-              ? "interview"
-              : "article";
-      return {
-        url: result.url,
-        title: result.title ?? result.url,
-        type: sourceType,
-        publishedAt: result.publishedDate,
-        snippet: result.text?.slice(0, 400),
+    if (response.ok) {
+      const data = (await response.json()) as {
+        results?: Array<{
+          url: string;
+          title?: string;
+          publishedDate?: string;
+          text?: string;
+        }>;
       };
-    });
+
+      for (const result of data.results ?? []) {
+        const lower = result.url.toLowerCase();
+        const sourceType: CandidateSource["type"] =
+          lower.includes("youtube.com") || lower.includes("youtu.be")
+            ? "video"
+            : lower.includes("twitter.com") || lower.includes("x.com")
+              ? "post"
+              : lower.includes("interview")
+                ? "interview"
+                : "article";
+        allResults.push({
+          url: result.url,
+          title: result.title ?? result.url,
+          type: sourceType,
+          publishedAt: result.publishedDate,
+          snippet: result.text?.slice(0, 400),
+        });
+      }
+    }
   } catch {
-    return [];
+    // Continue to video search even if article search fails
   }
+
+  // ── Search 2: YouTube videos (interviews, talks, podcasts) ──────────
+  const videoQuery = `${name} interview talk podcast ${titleParts} site:youtube.com`;
+  try {
+    const response = await fetch("https://api.exa.ai/search", {
+      method: "POST",
+      headers: {
+        "x-api-key": EXA_API_KEY,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        query: videoQuery,
+        numResults: 3,
+        type: "auto",
+        text: false,
+      }),
+    });
+
+    if (response.ok) {
+      const data = (await response.json()) as {
+        results?: Array<{
+          url: string;
+          title?: string;
+          publishedDate?: string;
+        }>;
+      };
+
+      for (const result of data.results ?? []) {
+        // Only include actual YouTube video pages (not search results / channels)
+        const ytId = extractYoutubeId(result.url);
+        if (!ytId) continue;
+
+        // Deduplicate against article search results
+        if (allResults.some((r) => r.url === result.url)) continue;
+
+        allResults.push({
+          url: result.url,
+          title: result.title ?? result.url,
+          type: "video" as const,
+          publishedAt: result.publishedDate,
+          snippet: `YouTube video: ${result.title ?? ""}`,
+        });
+      }
+    }
+  } catch {
+    // Non-fatal — we still have article results
+  }
+
+  return allResults;
 }
 
 function parseJson<T>(text: string, fallback: T): T {
@@ -546,6 +693,7 @@ export const runIngestion = action({
           sourceId: source._id,
           rawText: extracted.text,
           imageUrls: extracted.imageUrls,
+          transcriptText: extracted.transcriptText,
         });
         completed += 1;
         await ctx.runMutation(internal.pipeline.upsertJobPhase, {
@@ -712,6 +860,7 @@ export const runIngestion = action({
               sourceId: source._id,
               rawText: extracted.text,
               imageUrls: extracted.imageUrls,
+              transcriptText: extracted.transcriptText,
             });
 
             // Link to this stage directly
@@ -759,28 +908,66 @@ export const runIngestion = action({
         personId: args.personId,
       });
 
-      let embedded = 0;
+      // Batch embed: collect all chunks first, then embed in batches
+      const CHUNKS_PER_SOURCE = 10;
+      const BATCH_SIZE = 20; // texts per embedding API call
+
+      type PendingChunk = {
+        sourceId: Id<"sources">;
+        stageId: Id<"stages"> | undefined;
+        text: string;
+        citation: string;
+      };
+
+      const pendingChunks: PendingChunk[] = [];
       for (const source of allSources) {
         const stageLink = stageLinks.find((link: StageLinkEntry) => link.sourceId === source._id);
         const text = source.rawText ?? source.transcriptText ?? "";
         const chunks = splitChunks(text);
-        for (const chunk of chunks.slice(0, 18)) {
-          const embedding = await ctx.runAction(api.llm.embedText, { text: chunk });
-          await ctx.runMutation(internal.pipeline.insertChunk, {
-            personId: args.personId,
+        const citationJson = JSON.stringify({
+          sourceId: String(source._id),
+          title: source.title,
+          url: source.url,
+          publishedAt: source.publishedAt,
+        });
+        for (const chunk of chunks.slice(0, CHUNKS_PER_SOURCE)) {
+          pendingChunks.push({
             sourceId: source._id,
             stageId: stageLink?.stageId,
             text: chunk,
+            citation: citationJson,
+          });
+        }
+      }
+
+      let embedded = 0;
+      // Process in batches
+      for (let i = 0; i < pendingChunks.length; i += BATCH_SIZE) {
+        const batch = pendingChunks.slice(i, i + BATCH_SIZE);
+        const texts = batch.map((c) => c.text);
+        const embeddings: number[][] = await ctx.runAction(api.llm.embedTextBatch, { texts });
+
+        for (let j = 0; j < batch.length; j++) {
+          const chunk = batch[j];
+          const embedding = embeddings[j] ?? [];
+          await ctx.runMutation(internal.pipeline.insertChunk, {
+            personId: args.personId,
+            sourceId: chunk.sourceId,
+            stageId: chunk.stageId,
+            text: chunk.text,
             embedding,
-            citation: JSON.stringify({
-              sourceId: String(source._id),
-              title: source.title,
-              url: source.url,
-              publishedAt: source.publishedAt,
-            }),
+            citation: chunk.citation,
           });
           embedded += 1;
         }
+
+        // Update progress
+        await ctx.runMutation(internal.pipeline.upsertJobPhase, {
+          personId: args.personId,
+          phase: "embed",
+          status: "running",
+          progress: Math.round(((i + batch.length) / pendingChunks.length) * 100),
+        });
       }
 
       await ctx.runMutation(internal.pipeline.upsertJobPhase, {
@@ -1051,6 +1238,7 @@ export const updateSourceText = internalMutation({
     sourceId: v.id("sources"),
     rawText: v.string(),
     imageUrls: v.optional(v.array(v.string())),
+    transcriptText: v.optional(v.string()),
   },
   handler: async (ctx, args) => {
     const existing = await ctx.db.get(args.sourceId);
@@ -1059,9 +1247,11 @@ export const updateSourceText = internalMutation({
       ...prevMeta,
       ...(args.imageUrls && args.imageUrls.length > 0 ? { imageUrls: args.imageUrls } : {}),
     };
+    const bestText = args.transcriptText ?? args.rawText;
     await ctx.db.patch(args.sourceId, {
       rawText: args.rawText,
-      qualityScore: args.rawText.length > 800 ? 0.88 : 0.55,
+      transcriptText: args.transcriptText,
+      qualityScore: bestText.length > 800 ? 0.92 : 0.55,
       metadata: JSON.stringify(newMeta),
     });
   },

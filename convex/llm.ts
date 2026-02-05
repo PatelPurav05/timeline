@@ -73,6 +73,40 @@ export const embedText = action({
   },
 });
 
+/** Batch embed multiple texts in a single API call */
+export const embedTextBatch = action({
+  args: { texts: v.array(v.string()) },
+  handler: async (_ctx, args) => {
+    assertEnv();
+    if (args.texts.length === 0) return [];
+
+    const response = await fetchWithRetry("https://api.openai.com/v1/embeddings", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: OPENAI_EMBED_MODEL,
+        input: args.texts,
+      }),
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`Batch embedding request failed: ${errorText}`);
+    }
+
+    const data = (await response.json()) as {
+      data: Array<{ embedding: number[]; index: number }>;
+    };
+
+    // Sort by index to maintain input order
+    const sorted = data.data.sort((a, b) => a.index - b.index);
+    return sorted.map((d) => d.embedding);
+  },
+});
+
 export const generateStructuredJson = action({
   args: {
     system: v.string(),

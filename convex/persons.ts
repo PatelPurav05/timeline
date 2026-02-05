@@ -16,13 +16,57 @@ export const createPerson = mutation({
     name: v.string(),
     seedUrls: v.optional(v.array(v.string())),
   },
-  handler: async (ctx, args): Promise<{ personId: Id<"persons"> }> => {
+  handler: async (ctx, args): Promise<{ personId: Id<"persons">; existing: boolean }> => {
+    // Check if a person with this name already exists (case-insensitive)
+    const allPersons = await ctx.db.query("persons").collect();
+    const nameLower = args.name.trim().toLowerCase();
+    const existing = allPersons.find(
+      (p) => p.name.toLowerCase() === nameLower,
+    );
+    if (existing) {
+      return { personId: existing._id, existing: true };
+    }
+
     const personId: Id<"persons"> = await ctx.runMutation(api.pipeline.bootstrapPerson, {
       name: args.name,
       seedUrls: args.seedUrls,
     });
     await ctx.runMutation(api.pipeline.startIngestion, { personId });
-    return { personId };
+    return { personId, existing: false };
+  },
+});
+
+export const deletePerson = mutation({
+  args: { personId: v.id("persons") },
+  handler: async (ctx, args) => {
+    // Delete all related data in order
+    const chatSessions = await ctx.db.query("chatSessions").withIndex("by_person_stage").collect();
+    for (const session of chatSessions.filter((s) => s.personId === args.personId)) {
+      const messages = await ctx.db.query("chatMessages").withIndex("by_session", (q) => q.eq("sessionId", session._id)).collect();
+      for (const msg of messages) await ctx.db.delete(msg._id);
+      await ctx.db.delete(session._id);
+    }
+
+    const stages = await ctx.db.query("stages").withIndex("by_person", (q) => q.eq("personId", args.personId)).collect();
+    for (const stage of stages) {
+      const cards = await ctx.db.query("timelineCards").withIndex("by_stage", (q) => q.eq("stageId", stage._id)).collect();
+      for (const card of cards) await ctx.db.delete(card._id);
+      const links = await ctx.db.query("stageSourceLinks").withIndex("by_stage", (q) => q.eq("stageId", stage._id)).collect();
+      for (const link of links) await ctx.db.delete(link._id);
+      await ctx.db.delete(stage._id);
+    }
+
+    const chunks = await ctx.db.query("chunks").withIndex("by_person", (q) => q.eq("personId", args.personId)).collect();
+    for (const chunk of chunks) await ctx.db.delete(chunk._id);
+
+    const sources = await ctx.db.query("sources").withIndex("by_person", (q) => q.eq("personId", args.personId)).collect();
+    for (const source of sources) await ctx.db.delete(source._id);
+
+    const jobs = await ctx.db.query("jobs").withIndex("by_person", (q) => q.eq("personId", args.personId)).collect();
+    for (const job of jobs) await ctx.db.delete(job._id);
+
+    await ctx.db.delete(args.personId);
+    return { ok: true };
   },
 });
 
