@@ -315,16 +315,51 @@ export const sendStageChat = action({
       },
     );
 
+    // Extract direct quotes and speech samples from evidence to capture the person's voice
+    const voiceSamples: string[] = [];
+    for (const chunk of retrieval.chunks.slice(0, 5)) {
+      const text = chunk.text;
+      // Pull quoted speech (things in quotes that are likely the person talking)
+      const quoteMatches = text.match(/[""\u201C\u201D]([^""\u201C\u201D]{20,200})[""\u201C\u201D]/g);
+      if (quoteMatches) {
+        for (const q of quoteMatches.slice(0, 2)) {
+          voiceSamples.push(q.replace(/[""\u201C\u201D]/g, ""));
+        }
+      }
+      // Also grab sentences that look like first-person speech from transcripts
+      const sentences = text.split(/[.!?]+/).filter((s) => {
+        const trimmed = s.trim().toLowerCase();
+        return (trimmed.startsWith("i ") || trimmed.startsWith("we ") || trimmed.startsWith("my ")) && trimmed.length > 30 && trimmed.length < 250;
+      });
+      for (const s of sentences.slice(0, 2)) {
+        voiceSamples.push(s.trim());
+      }
+    }
+    // Deduplicate and limit
+    const uniqueVoice = [...new Set(voiceSamples)].slice(0, 6);
+
+    const voiceSection = uniqueVoice.length > 0
+      ? [
+          ``,
+          `Here are real quotes and speech samples from ${personResult.person.name} during this era. Study these carefully and mirror this exact tone, vocabulary, sentence structure, and personality in your responses:`,
+          ...uniqueVoice.map((q, i) => `  "${q}"`),
+          ``,
+          `Match this speaking style precisely. If they're casual, be casual. If they're technical, be technical. If they use specific phrases or verbal tics, use those too.`,
+        ].join("\n")
+      : "";
+
     const system: string = [
       `You ARE ${personResult.person.name}. You are literally this person, speaking in first person.`,
       `Right now you are in this period of your life: ${currentStage.title}.`,
       ``,
+      `Your worldview right now: ${currentStage.worldviewSummary}`,
+      `What's happening in your life: ${currentStage.eraSummary}`,
+      voiceSection,
+      ``,
       `How to behave:`,
       `- Speak naturally in first person as ${personResult.person.name} would. Use "I", "my", "we".`,
-      `- Adopt the personality, speech patterns, and tone this person is known for during this era.`,
-      `- Your worldview right now: ${currentStage.worldviewSummary}`,
-      `- What's happening in your life: ${currentStage.eraSummary}`,
-      `- Be conversational, opinionated, and authentic to how this person actually talks.`,
+      `- Your responses should sound indistinguishable from how ${personResult.person.name} actually talks in interviews, podcasts, and conversations from this era.`,
+      `- Be conversational, opinionated, and authentic. Use the same level of formality, humor, directness, and energy that this person is known for.`,
       `- If someone asks about the future beyond this era, you can speculate but make it clear you're looking ahead.`,
       ``,
       `Rules:`,
@@ -336,8 +371,6 @@ export const sendStageChat = action({
 
     const user: string = [
       `User question: ${args.message}`,
-      `Stage summary: ${currentStage.eraSummary}`,
-      `Worldview summary: ${currentStage.worldviewSummary}`,
       retrieval.usedFallback
         ? "Retrieval note: stage evidence was sparse; cross-stage fallback was used."
         : "Retrieval note: stage-scoped evidence only.",
