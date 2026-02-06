@@ -115,8 +115,17 @@ function stripHtml(html: string): string {
     .trim();
 }
 
+/** Remove broken unicode escapes and non-printable chars that break JSON serialization. */
+function sanitizeText(raw: string): string {
+  return raw
+    // Remove incomplete unicode escapes like \u00, \u0, \u
+    .replace(/\\u[0-9a-fA-F]{0,3}(?![0-9a-fA-F])/g, "")
+    // Remove null bytes and other control characters (keep newlines/tabs)
+    .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "");
+}
+
 function splitChunks(text: string, maxChars = 1200): string[] {
-  const clean = text.replace(/\s+/g, " ").trim();
+  const clean = sanitizeText(text).replace(/\s+/g, " ").trim();
   if (!clean) return [];
   const out: string[] = [];
   let cursor = 0;
@@ -989,11 +998,12 @@ export const runIngestion = action({
         for (const source of page.page) {
           processedSources += 1;
           const stageId = stageLinkMap.get(String(source._id));
-          const text = source.rawText ?? source.transcriptText ?? "";
+          const text = sanitizeText(source.rawText ?? source.transcriptText ?? "");
           const chunks = splitChunks(text).slice(0, CHUNKS_PER_SOURCE);
+          if (chunks.length === 0) continue;
           const citationJson = JSON.stringify({
             sourceId: String(source._id),
-            title: source.title,
+            title: sanitizeText(source.title),
             url: source.url,
             publishedAt: source.publishedAt,
           });
