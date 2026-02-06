@@ -69,6 +69,32 @@ type StageLinkEntry = {
   sourceId: Id<"sources">;
 };
 
+function normalizeStageDraft(raw: Partial<StageDraft>, index: number): StageDraft {
+  const safeNumber = (value: unknown, fallback: number) =>
+    typeof value === "number" && Number.isFinite(value) ? value : fallback;
+  const safeString = (value: unknown, fallback: string) =>
+    typeof value === "string" && value.trim() ? value.trim() : fallback;
+  const safeArray = (value: unknown) =>
+    Array.isArray(value) ? value.filter((item) => typeof item === "string" && item.trim()) : [];
+
+  const order = safeNumber(raw.order, index);
+  const ageStart = safeNumber(raw.ageStart, Math.max(0, index * 10));
+  const ageEnd = safeNumber(raw.ageEnd, ageStart + 9);
+
+  return {
+    order,
+    title: safeString(raw.title, `[${ageStart}-${ageEnd}] - Unnamed Era`),
+    ageStart,
+    ageEnd,
+    dateStart: safeString(raw.dateStart, "unknown"),
+    dateEnd: safeString(raw.dateEnd, "unknown"),
+    eraSummary: safeString(raw.eraSummary, "Biography era summary unavailable."),
+    worldviewSummary: safeString(raw.worldviewSummary, "Worldview summary unavailable."),
+    turningPoints: safeArray(raw.turningPoints).slice(0, 6),
+    confidence: safeNumber(raw.confidence, 0.5),
+  };
+}
+
 function stripHtml(html: string): string {
   return html
     .replace(/<script[\s\S]*?<\/script>/gi, " ")
@@ -718,18 +744,35 @@ export const runIngestion = action({
         progress: 10,
       });
 
-      const sourcesWithText: SourceDoc[] = await ctx.runQuery(internal.pipeline.listSourcesInternal, {
-        personId: args.personId,
-      });
-
-      const sourceDigest = sourcesWithText.map((source: SourceDoc) => ({
-        id: String(source._id),
-        title: source.title,
-        url: source.url,
-        type: source.type,
-        publishedAt: source.publishedAt,
-        textSample: (source.rawText ?? source.transcriptText ?? "").slice(0, 1000),
-      }));
+      const sourceDigest: Array<{
+        id: string;
+        title: string;
+        url: string;
+        type: SourceDoc["type"];
+        publishedAt?: string;
+        textSample: string;
+      }> = [];
+      let digestCursor: string | null = null;
+      while (sourceDigest.length < 30) {
+        const page = await ctx.runQuery(internal.pipeline.listSourcesPageInternal, {
+          personId: args.personId,
+          cursor: digestCursor ?? undefined,
+          limit: 10,
+        });
+        for (const source of page.page) {
+          sourceDigest.push({
+            id: String(source._id),
+            title: source.title,
+            url: source.url,
+            type: source.type,
+            publishedAt: source.publishedAt,
+            textSample: (source.rawText ?? source.transcriptText ?? "").slice(0, 1000),
+          });
+          if (sourceDigest.length >= 30) break;
+        }
+        if (page.isDone) break;
+        digestCursor = page.continueCursor;
+      }
 
       const stageJson = await ctx.runAction(api.llm.generateStructuredJson, {
         system:
@@ -780,6 +823,7 @@ export const runIngestion = action({
           },
         ];
       }
+      drafts = drafts.map((draft, index) => normalizeStageDraft(draft, index));
 
       const stageIds = await ctx.runMutation(internal.pipeline.replaceStages, {
         personId: args.personId,
@@ -790,38 +834,49 @@ export const runIngestion = action({
         personId: args.personId,
       });
 
-      for (const source of sourcesWithText) {
-        const matchJson = await ctx.runAction(api.llm.generateStructuredJson, {
-          system:
-            "Map this source to the best stage order. Output JSON object {stageOrder:number,relevance:number,rationale:string}. stageOrder must be one of provided stages.",
-          user: JSON.stringify({
-            source: {
-              title: source.title,
-              url: source.url,
-              type: source.type,
-              sample: (source.rawText ?? "").slice(0, 900),
-            },
-            stages: stages.map((stage: StageDoc) => ({
-              order: stage.order,
-              title: stage.title,
-              eraSummary: stage.eraSummary,
-            })),
-          }),
+      let mapCursor: string | null = null;
+      while (true) {
+        const page = await ctx.runQuery(internal.pipeline.listSourcesPageInternal, {
+          personId: args.personId,
+          cursor: mapCursor ?? undefined,
+          limit: 6,
         });
+        for (const source of page.page) {
+          const matchJson = await ctx.runAction(api.llm.generateStructuredJson, {
+            system:
+              "Map this source to the best stage order. Output JSON object {stageOrder:number,relevance:number,rationale:string}. stageOrder must be one of provided stages.",
+            user: JSON.stringify({
+              source: {
+                title: source.title,
+                url: source.url,
+                type: source.type,
+                sample: (source.rawText ?? source.transcriptText ?? "").slice(0, 900),
+              },
+              stages: stages.map((stage: StageDoc) => ({
+                order: stage.order,
+                title: stage.title,
+                eraSummary: stage.eraSummary,
+              })),
+            }),
+          });
 
-        const mapped = parseJson<{ stageOrder?: number; relevance?: number; rationale?: string }>(
-          matchJson,
-          {},
-        );
-        const chosen =
-          stages.find((stage: StageDoc) => stage.order === mapped.stageOrder) ?? stages[Math.min(source._creationTime % stages.length, stages.length - 1)];
+          const mapped = parseJson<{ stageOrder?: number; relevance?: number; rationale?: string }>(
+            matchJson,
+            {},
+          );
+          const chosen =
+            stages.find((stage: StageDoc) => stage.order === mapped.stageOrder) ??
+            stages[Math.min(source._creationTime % stages.length, stages.length - 1)];
 
-        await ctx.runMutation(internal.pipeline.linkSourceToStage, {
-          stageId: chosen._id,
-          sourceId: source._id,
-          relevance: Math.max(0.1, Math.min(1, mapped.relevance ?? 0.5)),
-          rationale: mapped.rationale ?? "Semantic era fit",
-        });
+          await ctx.runMutation(internal.pipeline.linkSourceToStage, {
+            stageId: chosen._id,
+            sourceId: source._id,
+            relevance: Math.max(0.1, Math.min(1, mapped.relevance ?? 0.5)),
+            rationale: mapped.rationale ?? "Semantic era fit",
+          });
+        }
+        if (page.isDone) break;
+        mapCursor = page.continueCursor;
       }
 
       await ctx.runMutation(internal.pipeline.upsertJobPhase, {
@@ -899,75 +954,66 @@ export const runIngestion = action({
         personId: args.personId,
       });
 
-      // Re-fetch all sources including deep research ones
-      const allSources: SourceDoc[] = await ctx.runQuery(internal.pipeline.listSourcesInternal, {
-        personId: args.personId,
-      });
-
       const stageLinks: StageLinkEntry[] = await ctx.runQuery(internal.pipeline.listStageLinksForPerson, {
         personId: args.personId,
       });
 
-      // Batch embed: collect all chunks first, then embed in batches
-      const CHUNKS_PER_SOURCE = 10;
-      const BATCH_SIZE = 20; // texts per embedding API call
-
-      type PendingChunk = {
-        sourceId: Id<"sources">;
-        stageId: Id<"stages"> | undefined;
-        text: string;
-        citation: string;
-      };
-
-      const pendingChunks: PendingChunk[] = [];
-      for (const source of allSources) {
-        const stageLink = stageLinks.find((link: StageLinkEntry) => link.sourceId === source._id);
-        const text = source.rawText ?? source.transcriptText ?? "";
-        const chunks = splitChunks(text);
-        const citationJson = JSON.stringify({
-          sourceId: String(source._id),
-          title: source.title,
-          url: source.url,
-          publishedAt: source.publishedAt,
-        });
-        for (const chunk of chunks.slice(0, CHUNKS_PER_SOURCE)) {
-          pendingChunks.push({
-            sourceId: source._id,
-            stageId: stageLink?.stageId,
-            text: chunk,
-            citation: citationJson,
-          });
-        }
+      const stageLinkMap = new Map<string, Id<"stages">>();
+      for (const link of stageLinks) {
+        stageLinkMap.set(String(link.sourceId), link.stageId);
       }
 
+      // Batch embed: process sources in small pages to stay under memory limits
+      const CHUNKS_PER_SOURCE = 10;
+      const BATCH_SIZE = 20; // texts per embedding API call
       let embedded = 0;
-      // Process in batches
-      for (let i = 0; i < pendingChunks.length; i += BATCH_SIZE) {
-        const batch = pendingChunks.slice(i, i + BATCH_SIZE);
-        const texts = batch.map((c) => c.text);
-        const embeddings: number[][] = await ctx.runAction(api.llm.embedTextBatch, { texts });
-
-        for (let j = 0; j < batch.length; j++) {
-          const chunk = batch[j];
-          const embedding = embeddings[j] ?? [];
-          await ctx.runMutation(internal.pipeline.insertChunk, {
-            personId: args.personId,
-            sourceId: chunk.sourceId,
-            stageId: chunk.stageId,
-            text: chunk.text,
-            embedding,
-            citation: chunk.citation,
-          });
-          embedded += 1;
-        }
-
-        // Update progress
-        await ctx.runMutation(internal.pipeline.upsertJobPhase, {
+      let processedSources = 0;
+      let embedCursor: string | null = null;
+      while (true) {
+        const page = await ctx.runQuery(internal.pipeline.listSourcesPageInternal, {
           personId: args.personId,
-          phase: "embed",
-          status: "running",
-          progress: Math.round(((i + batch.length) / pendingChunks.length) * 100),
+          cursor: embedCursor ?? undefined,
+          limit: 6,
         });
+        for (const source of page.page) {
+          processedSources += 1;
+          const stageId = stageLinkMap.get(String(source._id));
+          const text = source.rawText ?? source.transcriptText ?? "";
+          const chunks = splitChunks(text).slice(0, CHUNKS_PER_SOURCE);
+          const citationJson = JSON.stringify({
+            sourceId: String(source._id),
+            title: source.title,
+            url: source.url,
+            publishedAt: source.publishedAt,
+          });
+
+          for (let i = 0; i < chunks.length; i += BATCH_SIZE) {
+            const batchTexts = chunks.slice(i, i + BATCH_SIZE);
+            const embeddings: number[][] = await ctx.runAction(api.llm.embedTextBatch, {
+              texts: batchTexts,
+            });
+            for (let j = 0; j < batchTexts.length; j++) {
+              await ctx.runMutation(internal.pipeline.insertChunk, {
+                personId: args.personId,
+                sourceId: source._id,
+                stageId,
+                text: batchTexts[j],
+                embedding: embeddings[j] ?? [],
+                citation: citationJson,
+              });
+              embedded += 1;
+            }
+          }
+
+          await ctx.runMutation(internal.pipeline.upsertJobPhase, {
+            personId: args.personId,
+            phase: "embed",
+            status: "running",
+            progress: Math.min(99, Math.round((processedSources / (processedSources + 5)) * 100)),
+          });
+        }
+        if (page.isDone) break;
+        embedCursor = page.continueCursor;
       }
 
       await ctx.runMutation(internal.pipeline.upsertJobPhase, {
@@ -1097,6 +1143,22 @@ export const listSourcesInternal = internalQuery({
   args: { personId: v.id("persons") },
   handler: async (ctx, args) =>
     ctx.db.query("sources").withIndex("by_person", (q) => q.eq("personId", args.personId)).collect(),
+});
+
+export const listSourcesPageInternal = internalQuery({
+  args: {
+    personId: v.id("persons"),
+    cursor: v.optional(v.string()),
+    limit: v.optional(v.number()),
+  },
+  handler: async (ctx, args) =>
+    ctx.db
+      .query("sources")
+      .withIndex("by_person", (q) => q.eq("personId", args.personId))
+      .paginate({
+        cursor: args.cursor ?? null,
+        numItems: args.limit ?? 10,
+      }),
 });
 
 export const listStagesInternal = internalQuery({
