@@ -69,6 +69,17 @@ type StageLinkEntry = {
   sourceId: Id<"sources">;
 };
 
+type SourcesPage = {
+  page: SourceDoc[];
+  isDone: boolean;
+  continueCursor: string | null;
+};
+
+const internalPipeline = internal.pipeline as typeof internal.pipeline & {
+  // Generated types lag in this repo; cast to keep TS happy until codegen runs.
+  listSourcesPageInternal: any;
+};
+
 function normalizeStageDraft(raw: Partial<StageDraft>, index: number): StageDraft {
   const safeNumber = (value: unknown, fallback: number) =>
     typeof value === "number" && Number.isFinite(value) ? value : fallback;
@@ -754,11 +765,11 @@ export const runIngestion = action({
       }> = [];
       let digestCursor: string | null = null;
       while (sourceDigest.length < 30) {
-        const page = await ctx.runQuery(internal.pipeline.listSourcesPageInternal, {
+        const page: SourcesPage = (await ctx.runQuery(internalPipeline.listSourcesPageInternal, {
           personId: args.personId,
           cursor: digestCursor ?? undefined,
           limit: 10,
-        });
+        })) as SourcesPage;
         for (const source of page.page) {
           sourceDigest.push({
             id: String(source._id),
@@ -836,11 +847,11 @@ export const runIngestion = action({
 
       let mapCursor: string | null = null;
       while (true) {
-        const page = await ctx.runQuery(internal.pipeline.listSourcesPageInternal, {
+        const page: SourcesPage = (await ctx.runQuery(internalPipeline.listSourcesPageInternal, {
           personId: args.personId,
           cursor: mapCursor ?? undefined,
           limit: 6,
-        });
+        })) as SourcesPage;
         for (const source of page.page) {
           const matchJson = await ctx.runAction(api.llm.generateStructuredJson, {
             system:
@@ -970,11 +981,11 @@ export const runIngestion = action({
       let processedSources = 0;
       let embedCursor: string | null = null;
       while (true) {
-        const page = await ctx.runQuery(internal.pipeline.listSourcesPageInternal, {
+        const page: SourcesPage = (await ctx.runQuery(internalPipeline.listSourcesPageInternal, {
           personId: args.personId,
           cursor: embedCursor ?? undefined,
           limit: 6,
-        });
+        })) as SourcesPage;
         for (const source of page.page) {
           processedSources += 1;
           const stageId = stageLinkMap.get(String(source._id));
