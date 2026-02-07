@@ -151,9 +151,16 @@ export const _deletePersonDoc = internalMutation({
 });
 
 export const reingestPerson = mutation({
-  args: { personId: v.id("persons") },
+  args: {
+    personId: v.id("persons"),
+    fromPhase: v.optional(v.string()),
+  },
   handler: async (ctx, args) => {
-    await ctx.runMutation(api.pipeline.startIngestion, { personId: args.personId });
+    // Schedule ingestion from a specific phase (or from the start)
+    await ctx.scheduler.runAfter(0, api.pipeline.runIngestion, {
+      personId: args.personId,
+      phase: args.fromPhase ?? "discover",
+    });
     return { ok: true };
   },
 });

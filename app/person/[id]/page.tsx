@@ -104,28 +104,55 @@ export default function PersonPage({
       )}
 
       {/* ── Failed State ────────────────────────────── */}
-      {person.status === "failed" && (
-        <div className="mx-auto max-w-lg px-5 py-16 text-center">
-          <div className="comic-panel p-8">
-            <h2 className="text-balance text-3xl">Timeline Generation Failed</h2>
-            <p className="mt-3 text-pretty text-base text-[var(--muted)]">
-              Something went wrong while building this timeline. You can try
-              again below.
-            </p>
-            {jobs.find((j: { status: string; error?: string }) => j.status === "failed")?.error && (
-              <p className="mt-3 rounded-lg bg-red-50 p-3 text-sm text-red-700">
-                {jobs.find((j: { status: string; error?: string }) => j.status === "failed")?.error}
+      {person.status === "failed" && (() => {
+        const PHASE_ORDER = ["discover", "extract", "stage", "embed", "publish"];
+        const failedJob = jobs.find((j: { status: string }) => j.status === "failed");
+        const lastDoneJob = [...jobs]
+          .filter((j: { status: string }) => j.status === "done")
+          .sort((a: { phase: string }, b: { phase: string }) =>
+            PHASE_ORDER.indexOf(b.phase) - PHASE_ORDER.indexOf(a.phase)
+          )[0];
+        const resumePhase = failedJob
+          ? (failedJob as { phase: string }).phase
+          : lastDoneJob
+            ? PHASE_ORDER[PHASE_ORDER.indexOf((lastDoneJob as { phase: string }).phase) + 1]
+            : undefined;
+
+        return (
+          <div className="mx-auto max-w-lg px-5 py-16 text-center">
+            <div className="comic-panel p-8">
+              <h2 className="text-balance text-3xl">Timeline Generation Failed</h2>
+              <p className="mt-3 text-pretty text-base text-[var(--muted)]">
+                Something went wrong while building this timeline.
+                {resumePhase && (
+                  <> Failed during the <strong>{resumePhase}</strong> phase.</>
+                )}
               </p>
-            )}
-            <button
-              onClick={() => reingest({ personId })}
-              className="mt-6 rounded-xl border-2 border-[var(--frame)] bg-[var(--accent)] px-5 py-2.5 font-semibold text-white transition hover:translate-y-[-1px]"
-            >
-              Retry Ingestion
-            </button>
+              {(failedJob as { error?: string } | undefined)?.error && (
+                <p className="mt-3 rounded-lg bg-red-50 p-3 text-sm text-red-700">
+                  {(failedJob as { error?: string }).error}
+                </p>
+              )}
+              <div className="mt-6 flex flex-col items-center gap-3 sm:flex-row sm:justify-center">
+                {resumePhase && (
+                  <button
+                    onClick={() => reingest({ personId, fromPhase: resumePhase })}
+                    className="rounded-xl border-2 border-[var(--frame)] bg-[var(--accent)] px-5 py-2.5 font-semibold text-white transition hover:translate-y-[-1px]"
+                  >
+                    Resume from {resumePhase}
+                  </button>
+                )}
+                <button
+                  onClick={() => reingest({ personId, fromPhase: "discover" })}
+                  className="rounded-xl border-2 border-[var(--frame)] bg-[var(--panel)] px-5 py-2.5 font-semibold transition hover:translate-y-[-1px]"
+                >
+                  Retry from scratch
+                </button>
+              </div>
+            </div>
           </div>
-        </div>
-      )}
+        );
+      })()}
 
       {/* ── Ready State → Timeline ──────────────────── */}
       {person.status === "ready" && (

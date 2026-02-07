@@ -705,12 +705,21 @@ export const startIngestion = mutation({
   handler: async (ctx, args) => {
     await ctx.scheduler.runAfter(0, api.pipeline.runIngestion, {
       personId: args.personId,
+      phase: "discover",
     });
   },
 });
 
+/**
+ * Resume ingestion from a specific phase. Useful if a phase timed out.
+ * Each phase does its work and then schedules the NEXT phase,
+ * so a timeout in one phase doesn't lose prior work.
+ */
 export const runIngestion = action({
-  args: { personId: v.id("persons") },
+  args: {
+    personId: v.id("persons"),
+    phase: v.optional(v.string()),
+  },
   handler: async (ctx, args) => {
     const person = await ctx.runQuery(internal.pipeline.getPersonInternal, {
       personId: args.personId,
@@ -722,21 +731,25 @@ export const runIngestion = action({
       status: "processing",
     });
 
-    // Helper to call LLM from within this action
     const generateJson = async (system: string, user: string) =>
       ctx.runAction(api.llm.generateStructuredJson, { system, user });
 
-    try {
-      await ctx.runMutation(internal.pipeline.upsertJobPhase, {
-        personId: args.personId,
-        phase: "discover",
-        status: "running",
-        progress: 5,
-      });
+    const startPhase = args.phase ?? "discover";
 
-      // ── Step 1: Ask the LLM to generate smart, persona-aware search queries ──
-      const queryPlanJson = await generateJson(
-        `You are a research agent. Given a person's name, generate a comprehensive set of search queries to discover biographical sources about them.
+    try {
+      // ════════════════════════════════════════════════
+      //  PHASE 1: DISCOVER
+      // ════════════════════════════════════════════════
+      if (startPhase === "discover") {
+        await ctx.runMutation(internal.pipeline.upsertJobPhase, {
+          personId: args.personId,
+          phase: "discover",
+          status: "running",
+          progress: 5,
+        });
+
+        const queryPlanJson = await generateJson(
+          `You are a research agent. Given a person's name, generate a comprehensive set of search queries to discover biographical sources about them.
 
 The person could be ANYONE — a musician, athlete, politician, scientist, actor, entrepreneur, activist, author, etc. Tailor queries to their likely domain.
 
@@ -755,264 +768,338 @@ Generate 8-12 queries total. Include:
 5. 1 search specifically for OLD content (set dateEnd to filter for historical material)
 
 IMPORTANT: Use the person's full name in quotes in every query for precision.`,
-        JSON.stringify({ personName: person.name }),
-      );
-
-      const queryPlan = parseJson<{
-        queries?: Array<{
-          query: string;
-          type: "web" | "video";
-          dateEnd?: string;
-          dateStart?: string;
-        }>;
-      }>(queryPlanJson, { queries: [] });
-
-      const searchQueries = (queryPlan.queries ?? []).slice(0, 14);
-
-      // If the LLM returned nothing useful, use a minimal fallback
-      if (searchQueries.length === 0) {
-        searchQueries.push(
-          { query: `"${person.name}" biography profile`, type: "web" as const },
-          { query: `"${person.name}" interview`, type: "web" as const },
-          { query: `"${person.name}" interview talk`, type: "video" as const },
-          { query: `"${person.name}" rare early`, type: "video" as const },
+          JSON.stringify({ personName: person.name }),
         );
-      }
 
-      await ctx.runMutation(internal.pipeline.upsertJobPhase, {
-        personId: args.personId,
-        phase: "discover",
-        status: "running",
-        progress: 30,
-      });
+        const queryPlan = parseJson<{
+          queries?: Array<{
+            query: string;
+            type: "web" | "video";
+            dateEnd?: string;
+            dateStart?: string;
+          }>;
+        }>(queryPlanJson, { queries: [] });
 
-      // ── Step 2: Execute the search plan via Exa ──
-      let discovered = await executeSearchPlan(person.name, searchQueries);
-      if (discovered.length === 0) {
-        discovered = fallbackDiscovery(person.name);
-      }
+        const searchQueries = (queryPlan.queries ?? []).slice(0, 14);
+        if (searchQueries.length === 0) {
+          searchQueries.push(
+            { query: `"${person.name}" biography profile`, type: "web" as const },
+            { query: `"${person.name}" interview`, type: "web" as const },
+            { query: `"${person.name}" interview talk`, type: "video" as const },
+            { query: `"${person.name}" rare early`, type: "video" as const },
+          );
+        }
 
-      await ctx.runMutation(internal.pipeline.upsertJobPhase, {
-        personId: args.personId,
-        phase: "discover",
-        status: "running",
-        progress: 60,
-      });
-
-      // ── Step 3: Vet sources — filter out wrong-person / irrelevant results ──
-      const vetted = await vetSources(person.name, discovered, generateJson);
-      // Keep at least the fallback results if vetting is too aggressive
-      const finalSources = vetted.length >= 3 ? vetted : discovered;
-
-      await ctx.runMutation(internal.pipeline.replaceSources, {
-        personId: args.personId,
-        sources: finalSources,
-      });
-
-      await ctx.runMutation(internal.pipeline.upsertJobPhase, {
-        personId: args.personId,
-        phase: "discover",
-        status: "done",
-        progress: 100,
-      });
-
-      await ctx.runMutation(internal.pipeline.upsertJobPhase, {
-        personId: args.personId,
-        phase: "extract",
-        status: "running",
-        progress: 10,
-      });
-
-      const sources = await ctx.runQuery(internal.pipeline.listSourcesInternal, {
-        personId: args.personId,
-      });
-
-      let completed = 0;
-      for (const source of sources) {
-        const extracted = await extractSource({
-          url: source.url,
-          title: source.title,
-          type: source.type,
-          publishedAt: source.publishedAt,
-        }, person.name);
-        await ctx.runMutation(internal.pipeline.updateSourceText, {
-          sourceId: source._id,
-          rawText: extracted.text,
-          imageUrls: extracted.imageUrls,
-          transcriptText: extracted.transcriptText,
+        await ctx.runMutation(internal.pipeline.upsertJobPhase, {
+          personId: args.personId,
+          phase: "discover",
+          status: "running",
+          progress: 30,
         });
-        completed += 1;
+
+        let discovered = await executeSearchPlan(person.name, searchQueries);
+        if (discovered.length === 0) {
+          discovered = fallbackDiscovery(person.name);
+        }
+
+        await ctx.runMutation(internal.pipeline.upsertJobPhase, {
+          personId: args.personId,
+          phase: "discover",
+          status: "running",
+          progress: 60,
+        });
+
+        const vetted = await vetSources(person.name, discovered, generateJson);
+        const finalSources = vetted.length >= 3 ? vetted : discovered;
+
+        await ctx.runMutation(internal.pipeline.replaceSources, {
+          personId: args.personId,
+          sources: finalSources,
+        });
+
+        await ctx.runMutation(internal.pipeline.upsertJobPhase, {
+          personId: args.personId,
+          phase: "discover",
+          status: "done",
+          progress: 100,
+        });
+
+        // Chain to next phase
+        await ctx.scheduler.runAfter(0, api.pipeline.runIngestion, {
+          personId: args.personId,
+          phase: "extract",
+        });
+        return { ok: true, nextPhase: "extract" };
+      }
+
+      // ════════════════════════════════════════════════
+      //  PHASE 2: EXTRACT
+      // ════════════════════════════════════════════════
+      if (startPhase === "extract") {
         await ctx.runMutation(internal.pipeline.upsertJobPhase, {
           personId: args.personId,
           phase: "extract",
           status: "running",
-          progress: Math.round((completed / Math.max(sources.length, 1)) * 100),
+          progress: 10,
         });
-      }
 
-      await ctx.runMutation(internal.pipeline.upsertJobPhase, {
-        personId: args.personId,
-        phase: "extract",
-        status: "done",
-        progress: 100,
-      });
-
-      await ctx.runMutation(internal.pipeline.upsertJobPhase, {
-        personId: args.personId,
-        phase: "stage",
-        status: "running",
-        progress: 10,
-      });
-
-      const sourceDigest: Array<{
-        id: string;
-        title: string;
-        url: string;
-        type: SourceDoc["type"];
-        publishedAt?: string;
-        textSample: string;
-      }> = [];
-      let digestCursor: string | null = null;
-      while (sourceDigest.length < 30) {
-        const page: SourcesPage = (await ctx.runQuery(internalPipeline.listSourcesPageInternal, {
+        const sources: SourceDoc[] = await ctx.runQuery(internal.pipeline.listSourcesInternal, {
           personId: args.personId,
-          cursor: digestCursor ?? undefined,
-          limit: 10,
-        })) as SourcesPage;
-        for (const source of page.page) {
-          sourceDigest.push({
-            id: String(source._id),
-            title: source.title,
-            url: source.url,
-            type: source.type,
-            publishedAt: source.publishedAt,
-            textSample: (source.rawText ?? source.transcriptText ?? "").slice(0, 1000),
+        });
+
+        // Skip already-extracted sources (resumable)
+        const toExtract = sources.filter(
+          (s: SourceDoc) => !s.rawText && !s.transcriptText,
+        );
+
+        let completed = sources.length - toExtract.length;
+        for (const source of toExtract) {
+          const extracted = await extractSource(
+            {
+              url: source.url,
+              title: source.title,
+              type: source.type,
+              publishedAt: source.publishedAt,
+            },
+            person.name,
+          );
+          await ctx.runMutation(internal.pipeline.updateSourceText, {
+            sourceId: source._id,
+            rawText: extracted.text,
+            imageUrls: extracted.imageUrls,
+            transcriptText: extracted.transcriptText,
           });
-          if (sourceDigest.length >= 30) break;
+          completed += 1;
+          await ctx.runMutation(internal.pipeline.upsertJobPhase, {
+            personId: args.personId,
+            phase: "extract",
+            status: "running",
+            progress: Math.round(
+              (completed / Math.max(sources.length, 1)) * 100,
+            ),
+          });
         }
-        if (page.isDone) break;
-        digestCursor = page.continueCursor;
-      }
 
-      const stageJson = await ctx.runAction(api.llm.generateStructuredJson, {
-        system:
-          "You create biographical life stages by age-era first, then refine with context shifts. Output strict JSON object with key 'stages'. Each stage: order, title, ageStart, ageEnd, dateStart, dateEnd, eraSummary, worldviewSummary, turningPoints (array), confidence. Title MUST look like '[18-24] - Startup Operator: Early Builder'. Use 3-7 stages.",
-        user: JSON.stringify({ person: person.name, sources: sourceDigest }),
-      });
-
-      const parsed = parseJson<{ stages?: StageDraft[] }>(stageJson, { stages: [] });
-
-      let drafts = (parsed.stages ?? []).slice(0, 7);
-      if (drafts.length < 3) {
-        drafts = [
-          {
-            order: 0,
-            title: "[0-17] - Formative Years",
-            ageStart: 0,
-            ageEnd: 17,
-            dateStart: "unknown",
-            dateEnd: "unknown",
-            eraSummary: "Early development and education period.",
-            worldviewSummary: "Values and interests begin to form.",
-            turningPoints: ["Early interests emerge"],
-            confidence: 0.52,
-          },
-          {
-            order: 1,
-            title: "[18-29] - Early Builder",
-            ageStart: 18,
-            ageEnd: 29,
-            dateStart: "unknown",
-            dateEnd: "unknown",
-            eraSummary: "Hands-on execution and identity formation through work.",
-            worldviewSummary: "Pragmatic and experimental mindset strengthens.",
-            turningPoints: ["First major role", "Early public visibility"],
-            confidence: 0.49,
-          },
-          {
-            order: 2,
-            title: "[30-45] - Institutional Influence",
-            ageStart: 30,
-            ageEnd: 45,
-            dateStart: "unknown",
-            dateEnd: "present",
-            eraSummary: "Leadership and broad strategic influence expand.",
-            worldviewSummary: "Long-horizon decision-making dominates.",
-            turningPoints: ["Leadership transition", "Broader societal influence"],
-            confidence: 0.48,
-          },
-        ];
-      }
-      drafts = drafts.map((draft, index) => normalizeStageDraft(draft, index));
-
-      const stageIds = await ctx.runMutation(internal.pipeline.replaceStages, {
-        personId: args.personId,
-        stages: drafts,
-      });
-
-      const stages: StageDoc[] = await ctx.runQuery(internal.pipeline.listStagesInternal, {
-        personId: args.personId,
-      });
-
-      let mapCursor: string | null = null;
-      while (true) {
-        const page: SourcesPage = (await ctx.runQuery(internalPipeline.listSourcesPageInternal, {
+        await ctx.runMutation(internal.pipeline.upsertJobPhase, {
           personId: args.personId,
-          cursor: mapCursor ?? undefined,
-          limit: 6,
-        })) as SourcesPage;
-        for (const source of page.page) {
-          const matchJson = await ctx.runAction(api.llm.generateStructuredJson, {
-            system:
-              "Map this source to the best stage order. Output JSON object {stageOrder:number,relevance:number,rationale:string}. stageOrder must be one of provided stages.",
-            user: JSON.stringify({
-              source: {
+          phase: "extract",
+          status: "done",
+          progress: 100,
+        });
+
+        await ctx.scheduler.runAfter(0, api.pipeline.runIngestion, {
+          personId: args.personId,
+          phase: "stage",
+        });
+        return { ok: true, nextPhase: "stage" };
+      }
+
+      // ════════════════════════════════════════════════
+      //  PHASE 3: STAGE (create stages + deep research)
+      // ════════════════════════════════════════════════
+      if (startPhase === "stage") {
+        await ctx.runMutation(internal.pipeline.upsertJobPhase, {
+          personId: args.personId,
+          phase: "stage",
+          status: "running",
+          progress: 10,
+        });
+
+        // Check if stages already exist (resume case)
+        let stages: StageDoc[] = await ctx.runQuery(
+          internal.pipeline.listStagesInternal,
+          { personId: args.personId },
+        );
+
+        if (stages.length === 0) {
+          // Build source digest
+          const sourceDigest: Array<{
+            id: string;
+            title: string;
+            url: string;
+            type: SourceDoc["type"];
+            publishedAt?: string;
+            textSample: string;
+          }> = [];
+          let digestCursor: string | null = null;
+          while (sourceDigest.length < 30) {
+            const page: SourcesPage = (await ctx.runQuery(
+              internalPipeline.listSourcesPageInternal,
+              {
+                personId: args.personId,
+                cursor: digestCursor ?? undefined,
+                limit: 10,
+              },
+            )) as SourcesPage;
+            for (const source of page.page) {
+              sourceDigest.push({
+                id: String(source._id),
                 title: source.title,
                 url: source.url,
                 type: source.type,
-                sample: (source.rawText ?? source.transcriptText ?? "").slice(0, 900),
-              },
-              stages: stages.map((stage: StageDoc) => ({
-                order: stage.order,
-                title: stage.title,
-                eraSummary: stage.eraSummary,
-              })),
-            }),
-          });
+                publishedAt: source.publishedAt,
+                textSample: (
+                  source.rawText ??
+                  source.transcriptText ??
+                  ""
+                ).slice(0, 1000),
+              });
+              if (sourceDigest.length >= 30) break;
+            }
+            if (page.isDone) break;
+            digestCursor = page.continueCursor;
+          }
 
-          const mapped = parseJson<{ stageOrder?: number; relevance?: number; rationale?: string }>(
-            matchJson,
-            {},
+          const stageJson = await generateJson(
+            "You create biographical life stages by age-era first, then refine with context shifts. Output strict JSON object with key 'stages'. Each stage: order, title, ageStart, ageEnd, dateStart, dateEnd, eraSummary, worldviewSummary, turningPoints (array), confidence. Title MUST look like '[18-24] - Startup Operator: Early Builder'. Use 3-7 stages.",
+            JSON.stringify({ person: person.name, sources: sourceDigest }),
           );
-          const chosen =
-            stages.find((stage: StageDoc) => stage.order === mapped.stageOrder) ??
-            stages[Math.min(source._creationTime % stages.length, stages.length - 1)];
 
-          await ctx.runMutation(internal.pipeline.linkSourceToStage, {
-            stageId: chosen._id,
-            sourceId: source._id,
-            relevance: Math.max(0.1, Math.min(1, mapped.relevance ?? 0.5)),
-            rationale: mapped.rationale ?? "Semantic era fit",
+          const parsed = parseJson<{ stages?: StageDraft[] }>(stageJson, {
+            stages: [],
           });
+
+          let drafts = (parsed.stages ?? []).slice(0, 7);
+          if (drafts.length < 3) {
+            drafts = [
+              {
+                order: 0,
+                title: "[0-17] - Formative Years",
+                ageStart: 0,
+                ageEnd: 17,
+                dateStart: "unknown",
+                dateEnd: "unknown",
+                eraSummary: "Early development and education period.",
+                worldviewSummary: "Values and interests begin to form.",
+                turningPoints: ["Early interests emerge"],
+                confidence: 0.52,
+              },
+              {
+                order: 1,
+                title: "[18-29] - Early Builder",
+                ageStart: 18,
+                ageEnd: 29,
+                dateStart: "unknown",
+                dateEnd: "unknown",
+                eraSummary:
+                  "Hands-on execution and identity formation through work.",
+                worldviewSummary:
+                  "Pragmatic and experimental mindset strengthens.",
+                turningPoints: [
+                  "First major role",
+                  "Early public visibility",
+                ],
+                confidence: 0.49,
+              },
+              {
+                order: 2,
+                title: "[30-45] - Institutional Influence",
+                ageStart: 30,
+                ageEnd: 45,
+                dateStart: "unknown",
+                dateEnd: "present",
+                eraSummary:
+                  "Leadership and broad strategic influence expand.",
+                worldviewSummary:
+                  "Long-horizon decision-making dominates.",
+                turningPoints: [
+                  "Leadership transition",
+                  "Broader societal influence",
+                ],
+                confidence: 0.48,
+              },
+            ];
+          }
+          drafts = drafts.map((draft, index) =>
+            normalizeStageDraft(draft, index),
+          );
+
+          await ctx.runMutation(internal.pipeline.replaceStages, {
+            personId: args.personId,
+            stages: drafts,
+          });
+
+          stages = await ctx.runQuery(internal.pipeline.listStagesInternal, {
+            personId: args.personId,
+          });
+
+          // Map sources to stages
+          let mapCursor: string | null = null;
+          while (true) {
+            const page: SourcesPage = (await ctx.runQuery(
+              internalPipeline.listSourcesPageInternal,
+              {
+                personId: args.personId,
+                cursor: mapCursor ?? undefined,
+                limit: 6,
+              },
+            )) as SourcesPage;
+            for (const source of page.page) {
+              const matchJson = await generateJson(
+                "Map this source to the best stage order. Output JSON object {stageOrder:number,relevance:number,rationale:string}. stageOrder must be one of provided stages.",
+                JSON.stringify({
+                  source: {
+                    title: source.title,
+                    url: source.url,
+                    type: source.type,
+                    sample: (
+                      source.rawText ??
+                      source.transcriptText ??
+                      ""
+                    ).slice(0, 900),
+                  },
+                  stages: stages.map((stage: StageDoc) => ({
+                    order: stage.order,
+                    title: stage.title,
+                    eraSummary: stage.eraSummary,
+                  })),
+                }),
+              );
+
+              const mapped = parseJson<{
+                stageOrder?: number;
+                relevance?: number;
+                rationale?: string;
+              }>(matchJson, {});
+              const chosen =
+                stages.find(
+                  (stage: StageDoc) => stage.order === mapped.stageOrder,
+                ) ??
+                stages[
+                  Math.min(
+                    source._creationTime % stages.length,
+                    stages.length - 1,
+                  )
+                ];
+
+              await ctx.runMutation(internal.pipeline.linkSourceToStage, {
+                stageId: chosen._id,
+                sourceId: source._id,
+                relevance: Math.max(
+                  0.1,
+                  Math.min(1, mapped.relevance ?? 0.5),
+                ),
+                rationale: mapped.rationale ?? "Semantic era fit",
+              });
+            }
+            if (page.isDone) break;
+            mapCursor = page.continueCursor;
+          }
         }
-        if (page.isDone) break;
-        mapCursor = page.continueCursor;
-      }
 
-      await ctx.runMutation(internal.pipeline.upsertJobPhase, {
-        personId: args.personId,
-        phase: "stage",
-        status: "running",
-        progress: 70,
-      });
+        await ctx.runMutation(internal.pipeline.upsertJobPhase, {
+          personId: args.personId,
+          phase: "stage",
+          status: "running",
+          progress: 70,
+        });
 
-      // ── Deep research per stage (LLM-driven queries + vetting) ──────────
-      for (let si = 0; si < stages.length; si += 1) {
-        const stage = stages[si];
+        // Deep research per stage
+        for (let si = 0; si < stages.length; si += 1) {
+          const stage = stages[si];
 
-        // Ask the LLM to generate stage-specific search queries
-        const stageQueryJson = await generateJson(
-          `You are a research agent doing deep research on a specific era of a person's life.
+          const stageQueryJson = await generateJson(
+            `You are a research agent doing deep research on a specific era of a person's life.
 Given the person's name and a life stage with its title, summary, and turning points, generate targeted search queries to find sources about THIS SPECIFIC ERA.
 
 The person could be anyone — musician, athlete, founder, engineer, politician, scientist, actor, etc. Tailor queries to their domain and this specific period.
@@ -1030,209 +1117,265 @@ Generate 6-8 queries:
 2. 2 video searches for mainstream content (talks, performances, matches, appearances)
 3. 2 video searches for rare/underground/early content from this era (niche podcasts, small events, old footage, fan recordings, local news)
 4. 1-2 queries targeting specific turning points or key moments from this stage`,
-          JSON.stringify({
-            personName: person.name,
-            stageTitle: stage.title,
-            eraSummary: stage.eraSummary,
-            turningPoints: stage.turningPoints,
-            dateStart: stage.dateStart,
-            dateEnd: stage.dateEnd,
-          }),
-        );
+            JSON.stringify({
+              personName: person.name,
+              stageTitle: stage.title,
+              eraSummary: stage.eraSummary,
+              turningPoints: stage.turningPoints,
+              dateStart: stage.dateStart,
+              dateEnd: stage.dateEnd,
+            }),
+          );
 
-        const stageQueryPlan = parseJson<{
-          queries?: Array<{
-            query: string;
-            type: "web" | "video";
-            dateStart?: string;
-            dateEnd?: string;
-          }>;
-        }>(stageQueryJson, { queries: [] });
+          const stageQueryPlan = parseJson<{
+            queries?: Array<{
+              query: string;
+              type: "web" | "video";
+              dateStart?: string;
+              dateEnd?: string;
+            }>;
+          }>(stageQueryJson, { queries: [] });
 
-        const stageSearchQueries = (stageQueryPlan.queries ?? []).slice(0, 10);
+          const stageSearchQueries = (stageQueryPlan.queries ?? []).slice(
+            0,
+            10,
+          );
 
-        let deepSources = await deepResearchStage(
-          person.name,
-          stage,
-          stageSearchQueries,
-        );
+          let deepSources = await deepResearchStage(
+            person.name,
+            stage,
+            stageSearchQueries,
+          );
 
-        // Vet deep research sources for relevance
-        if (deepSources.length > 0) {
-          deepSources = await vetSources(person.name, deepSources, generateJson);
-        }
-
-        if (deepSources.length > 0) {
-          // Add new sources (avoiding duplicates)
-          await ctx.runMutation(internal.pipeline.addSources, {
-            personId: args.personId,
-            sources: deepSources,
-          });
-
-          // Extract content from new deep sources
-          const newSources: SourceDoc[] = await ctx.runQuery(internal.pipeline.listSourcesInternal, {
-            personId: args.personId,
-          });
-          const deepUrls = new Set(deepSources.map((s) => s.url));
-          const justAdded = newSources.filter((s: SourceDoc) => deepUrls.has(s.url) && !s.rawText);
-
-          for (const source of justAdded) {
-            const extracted = await extractSource({
-              url: source.url,
-              title: source.title,
-              type: source.type,
-              publishedAt: source.publishedAt,
-            }, person.name);
-            await ctx.runMutation(internal.pipeline.updateSourceText, {
-              sourceId: source._id,
-              rawText: extracted.text,
-              imageUrls: extracted.imageUrls,
-              transcriptText: extracted.transcriptText,
-            });
-
-            // Link to this stage directly
-            await ctx.runMutation(internal.pipeline.linkSourceToStage, {
-              stageId: stage._id,
-              sourceId: source._id,
-              relevance: 0.85,
-              rationale: "Deep research: stage-targeted Exa discovery",
-            });
+          if (deepSources.length > 0) {
+            deepSources = await vetSources(
+              person.name,
+              deepSources,
+              generateJson,
+            );
           }
-        }
 
-        await ctx.runMutation(internal.pipeline.upsertJobPhase, {
-          personId: args.personId,
-          phase: "stage",
-          status: "running",
-          progress: 70 + Math.round(((si + 1) / stages.length) * 30),
-        });
-      }
-
-      await ctx.runMutation(internal.pipeline.upsertJobPhase, {
-        personId: args.personId,
-        phase: "stage",
-        status: "done",
-        progress: 100,
-      });
-
-      await ctx.runMutation(internal.pipeline.upsertJobPhase, {
-        personId: args.personId,
-        phase: "embed",
-        status: "running",
-        progress: 10,
-      });
-
-      await ctx.runMutation(internal.pipeline.clearChunksForPerson, {
-        personId: args.personId,
-      });
-
-      const stageLinks: StageLinkEntry[] = await ctx.runQuery(internal.pipeline.listStageLinksForPerson, {
-        personId: args.personId,
-      });
-
-      const stageLinkMap = new Map<string, Id<"stages">>();
-      for (const link of stageLinks) {
-        stageLinkMap.set(String(link.sourceId), link.stageId);
-      }
-
-      // Batch embed: process sources in small pages to stay under memory limits
-      const CHUNKS_PER_SOURCE = 10;
-      const BATCH_SIZE = 20; // texts per embedding API call
-      let embedded = 0;
-      let processedSources = 0;
-      let embedCursor: string | null = null;
-      while (true) {
-        const page: SourcesPage = (await ctx.runQuery(internalPipeline.listSourcesPageInternal, {
-          personId: args.personId,
-          cursor: embedCursor ?? undefined,
-          limit: 6,
-        })) as SourcesPage;
-        for (const source of page.page) {
-          processedSources += 1;
-          const stageId = stageLinkMap.get(String(source._id));
-          const text = sanitizeText(source.rawText ?? source.transcriptText ?? "");
-          const chunks = splitChunks(text).slice(0, CHUNKS_PER_SOURCE);
-          if (chunks.length === 0) continue;
-          const citationJson = JSON.stringify({
-            sourceId: String(source._id),
-            title: sanitizeText(source.title),
-            url: source.url,
-            publishedAt: source.publishedAt,
-          });
-
-          for (let i = 0; i < chunks.length; i += BATCH_SIZE) {
-            const batchTexts = chunks.slice(i, i + BATCH_SIZE);
-            const embeddings: number[][] = await ctx.runAction(api.llm.embedTextBatch, {
-              texts: batchTexts,
+          if (deepSources.length > 0) {
+            await ctx.runMutation(internal.pipeline.addSources, {
+              personId: args.personId,
+              sources: deepSources,
             });
-            for (let j = 0; j < batchTexts.length; j++) {
-              await ctx.runMutation(internal.pipeline.insertChunk, {
-                personId: args.personId,
+
+            const newSources: SourceDoc[] = await ctx.runQuery(
+              internal.pipeline.listSourcesInternal,
+              { personId: args.personId },
+            );
+            const deepUrls = new Set(deepSources.map((s) => s.url));
+            const justAdded = newSources.filter(
+              (s: SourceDoc) => deepUrls.has(s.url) && !s.rawText,
+            );
+
+            for (const source of justAdded) {
+              const extracted = await extractSource(
+                {
+                  url: source.url,
+                  title: source.title,
+                  type: source.type,
+                  publishedAt: source.publishedAt,
+                },
+                person.name,
+              );
+              await ctx.runMutation(internal.pipeline.updateSourceText, {
                 sourceId: source._id,
-                stageId,
-                text: batchTexts[j],
-                embedding: embeddings[j] ?? [],
-                citation: citationJson,
+                rawText: extracted.text,
+                imageUrls: extracted.imageUrls,
+                transcriptText: extracted.transcriptText,
               });
-              embedded += 1;
+
+              await ctx.runMutation(internal.pipeline.linkSourceToStage, {
+                stageId: stage._id,
+                sourceId: source._id,
+                relevance: 0.85,
+                rationale: "Deep research: stage-targeted discovery",
+              });
             }
           }
 
           await ctx.runMutation(internal.pipeline.upsertJobPhase, {
             personId: args.personId,
-            phase: "embed",
+            phase: "stage",
             status: "running",
-            progress: Math.min(99, Math.round((processedSources / (processedSources + 5)) * 100)),
+            progress: 70 + Math.round(((si + 1) / stages.length) * 30),
           });
         }
-        if (page.isDone) break;
-        embedCursor = page.continueCursor;
+
+        await ctx.runMutation(internal.pipeline.upsertJobPhase, {
+          personId: args.personId,
+          phase: "stage",
+          status: "done",
+          progress: 100,
+        });
+
+        await ctx.scheduler.runAfter(0, api.pipeline.runIngestion, {
+          personId: args.personId,
+          phase: "embed",
+        });
+        return { ok: true, nextPhase: "embed" };
       }
 
-      await ctx.runMutation(internal.pipeline.upsertJobPhase, {
-        personId: args.personId,
-        phase: "embed",
-        status: "done",
-        progress: embedded > 0 ? 100 : 0,
-      });
+      // ════════════════════════════════════════════════
+      //  PHASE 4: EMBED
+      // ════════════════════════════════════════════════
+      if (startPhase === "embed") {
+        await ctx.runMutation(internal.pipeline.upsertJobPhase, {
+          personId: args.personId,
+          phase: "embed",
+          status: "running",
+          progress: 10,
+        });
 
-      await ctx.runMutation(internal.pipeline.upsertJobPhase, {
-        personId: args.personId,
-        phase: "publish",
-        status: "running",
-        progress: 20,
-      });
+        const stageLinks: StageLinkEntry[] = await ctx.runQuery(
+          internal.pipeline.listStageLinksForPerson,
+          { personId: args.personId },
+        );
 
-      // Search for actual person images per stage via Exa
-      const personImagesByStage: Record<string, string[]> = {};
-      const refreshedStages: StageDoc[] = await ctx.runQuery(internal.pipeline.listStagesInternal, {
-        personId: args.personId,
-      });
-      for (const stage of refreshedStages) {
-        const images = await searchPersonImages(person.name, stage.title);
-        if (images.length > 0) {
-          personImagesByStage[String(stage._id)] = images;
+        const stageLinkMap = new Map<string, Id<"stages">>();
+        for (const link of stageLinks) {
+          stageLinkMap.set(String(link.sourceId), link.stageId);
         }
+
+        // Find which sources already have chunks (for resume)
+        const existingChunks: Array<{ sourceId: Id<"sources"> }> =
+          await ctx.runQuery(internal.pipeline.listChunkSourceIds, {
+            personId: args.personId,
+          });
+        const embeddedSourceIds = new Set(
+          existingChunks.map((c) => String(c.sourceId)),
+        );
+
+        const CHUNKS_PER_SOURCE = 10;
+        const BATCH_SIZE = 20;
+        let embedded = 0;
+        let processedSources = 0;
+        let embedCursor: string | null = null;
+
+        while (true) {
+          const page: SourcesPage = (await ctx.runQuery(
+            internalPipeline.listSourcesPageInternal,
+            {
+              personId: args.personId,
+              cursor: embedCursor ?? undefined,
+              limit: 6,
+            },
+          )) as SourcesPage;
+
+          for (const source of page.page) {
+            processedSources += 1;
+
+            // Skip if this source already has chunks (resume)
+            if (embeddedSourceIds.has(String(source._id))) continue;
+
+            const stageId = stageLinkMap.get(String(source._id));
+            const text = sanitizeText(
+              source.rawText ?? source.transcriptText ?? "",
+            );
+            const chunks = splitChunks(text).slice(0, CHUNKS_PER_SOURCE);
+            if (chunks.length === 0) continue;
+            const citationJson = JSON.stringify({
+              sourceId: String(source._id),
+              title: sanitizeText(source.title),
+              url: source.url,
+              publishedAt: source.publishedAt,
+            });
+
+            for (let i = 0; i < chunks.length; i += BATCH_SIZE) {
+              const batchTexts = chunks.slice(i, i + BATCH_SIZE);
+              const embeddings: number[][] = await ctx.runAction(
+                api.llm.embedTextBatch,
+                { texts: batchTexts },
+              );
+              for (let j = 0; j < batchTexts.length; j++) {
+                await ctx.runMutation(internal.pipeline.insertChunk, {
+                  personId: args.personId,
+                  sourceId: source._id,
+                  stageId,
+                  text: batchTexts[j],
+                  embedding: embeddings[j] ?? [],
+                  citation: citationJson,
+                });
+                embedded += 1;
+              }
+            }
+
+            await ctx.runMutation(internal.pipeline.upsertJobPhase, {
+              personId: args.personId,
+              phase: "embed",
+              status: "running",
+              progress: Math.min(
+                99,
+                Math.round(
+                  (processedSources / (processedSources + 5)) * 100,
+                ),
+              ),
+            });
+          }
+          if (page.isDone) break;
+          embedCursor = page.continueCursor;
+        }
+
+        await ctx.runMutation(internal.pipeline.upsertJobPhase, {
+          personId: args.personId,
+          phase: "embed",
+          status: "done",
+          progress: embedded > 0 ? 100 : 0,
+        });
+
+        await ctx.scheduler.runAfter(0, api.pipeline.runIngestion, {
+          personId: args.personId,
+          phase: "publish",
+        });
+        return { ok: true, nextPhase: "publish" };
       }
 
-      await ctx.runMutation(internal.pipeline.replaceTimelineCards, {
-        personId: args.personId,
-        personImages: JSON.stringify(personImagesByStage),
-      });
+      // ════════════════════════════════════════════════
+      //  PHASE 5: PUBLISH
+      // ════════════════════════════════════════════════
+      if (startPhase === "publish") {
+        await ctx.runMutation(internal.pipeline.upsertJobPhase, {
+          personId: args.personId,
+          phase: "publish",
+          status: "running",
+          progress: 20,
+        });
 
-      await ctx.runMutation(internal.pipeline.upsertJobPhase, {
-        personId: args.personId,
-        phase: "publish",
-        status: "done",
-        progress: 100,
-      });
+        const personImagesByStage: Record<string, string[]> = {};
+        const refreshedStages: StageDoc[] = await ctx.runQuery(
+          internal.pipeline.listStagesInternal,
+          { personId: args.personId },
+        );
+        for (const stage of refreshedStages) {
+          const images = await searchPersonImages(person.name, stage.title);
+          if (images.length > 0) {
+            personImagesByStage[String(stage._id)] = images;
+          }
+        }
 
-      await ctx.runMutation(internal.pipeline.markPersonStatus, {
-        personId: args.personId,
-        status: "ready",
-      });
+        await ctx.runMutation(internal.pipeline.replaceTimelineCards, {
+          personId: args.personId,
+          personImages: JSON.stringify(personImagesByStage),
+        });
 
-      return { ok: true };
+        await ctx.runMutation(internal.pipeline.upsertJobPhase, {
+          personId: args.personId,
+          phase: "publish",
+          status: "done",
+          progress: 100,
+        });
+
+        await ctx.runMutation(internal.pipeline.markPersonStatus, {
+          personId: args.personId,
+          status: "ready",
+        });
+
+        return { ok: true, done: true };
+      }
+
+      throw new Error(`Unknown phase: ${startPhase}`);
     } catch (error) {
       await ctx.runMutation(internal.pipeline.markPersonStatus, {
         personId: args.personId,
@@ -1240,7 +1383,8 @@ Generate 6-8 queries:
       });
       await ctx.runMutation(internal.pipeline.markLatestRunningJobFailed, {
         personId: args.personId,
-        message: error instanceof Error ? error.message : "Unknown ingestion failure",
+        message:
+          error instanceof Error ? error.message : "Unknown ingestion failure",
       });
       throw error;
     }
@@ -1354,6 +1498,26 @@ export const listChunksByPerson = internalQuery({
   args: { personId: v.id("persons") },
   handler: async (ctx, args) =>
     ctx.db.query("chunks").withIndex("by_person", (q) => q.eq("personId", args.personId)).collect(),
+});
+
+/** Return unique source IDs that already have chunks (for embed resume). */
+export const listChunkSourceIds = internalQuery({
+  args: { personId: v.id("persons") },
+  handler: async (ctx, args) => {
+    const chunks = await ctx.db
+      .query("chunks")
+      .withIndex("by_person", (q) => q.eq("personId", args.personId))
+      .collect();
+    const seen = new Set<string>();
+    const result: Array<{ sourceId: Id<"sources"> }> = [];
+    for (const chunk of chunks) {
+      const key = String(chunk.sourceId);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      result.push({ sourceId: chunk.sourceId });
+    }
+    return result;
+  },
 });
 
 export const listStageLinksForPerson = internalQuery({
