@@ -151,50 +151,176 @@ function cosineSimilarity(a: number[], b: number[]): number {
   return dot / (Math.sqrt(magA) * Math.sqrt(magB));
 }
 
-async function discoverWithExa(name: string): Promise<CandidateSource[]> {
+async function exaSearch(
+  query: string,
+  opts: {
+    numResults?: number;
+    text?: boolean;
+    includeDomains?: string[];
+    startPublishedDate?: string;
+    endPublishedDate?: string;
+  } = {},
+): Promise<
+  Array<{ url: string; title?: string; publishedDate?: string; text?: string }>
+> {
   if (!EXA_API_KEY) return [];
-  const response = await fetch("https://api.exa.ai/search", {
-    method: "POST",
-    headers: {
-      "x-api-key": EXA_API_KEY,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      query: `${name} interviews talks biography timeline`,
-      numResults: 12,
-      type: "auto",
-      text: true,
-    }),
-  });
+  const body: Record<string, unknown> = {
+    query,
+    numResults: opts.numResults ?? 10,
+    type: "auto",
+    text: opts.text ?? false,
+  };
+  if (opts.includeDomains) body.includeDomains = opts.includeDomains;
+  if (opts.startPublishedDate)
+    body.startPublishedDate = opts.startPublishedDate;
+  if (opts.endPublishedDate) body.endPublishedDate = opts.endPublishedDate;
 
-  if (!response.ok) return [];
-  const data = (await response.json()) as {
-    results?: Array<{
+  try {
+    const response = await fetch("https://api.exa.ai/search", {
+      method: "POST",
+      headers: {
+        "x-api-key": EXA_API_KEY,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(body),
+    });
+    if (!response.ok) return [];
+    const data = (await response.json()) as {
+      results?: Array<{
+        url: string;
+        title?: string;
+        publishedDate?: string;
+        text?: string;
+      }>;
+    };
+    return data.results ?? [];
+  } catch {
+    return [];
+  }
+}
+
+function classifySourceType(url: string): CandidateSource["type"] {
+  const lower = url.toLowerCase();
+  if (lower.includes("youtube.com") || lower.includes("youtu.be"))
+    return "video";
+  if (lower.includes("twitter.com") || lower.includes("x.com")) return "post";
+  if (lower.includes("interview")) return "interview";
+  return "article";
+}
+
+/**
+ * Execute a set of LLM-generated search queries via Exa and collect deduplicated results.
+ */
+async function executeSearchPlan(
+  name: string,
+  queries: Array<{
+    query: string;
+    type: "web" | "video";
+    dateStart?: string;
+    dateEnd?: string;
+  }>,
+): Promise<CandidateSource[]> {
+  if (!EXA_API_KEY) return [];
+
+  const seen = new Set<string>();
+  const all: CandidateSource[] = [];
+
+  const addResults = (
+    results: Array<{
       url: string;
       title?: string;
       publishedDate?: string;
       text?: string;
-    }>;
+    }>,
+    overrideType?: CandidateSource["type"],
+  ) => {
+    for (const r of results) {
+      if (seen.has(r.url)) continue;
+      seen.add(r.url);
+      all.push({
+        url: r.url,
+        title: r.title ?? r.url,
+        type: overrideType ?? classifySourceType(r.url),
+        publishedAt: r.publishedDate,
+        snippet: r.text?.slice(0, 400),
+      });
+    }
   };
 
-  return (data.results ?? []).map((result) => {
-    const lower = result.url.toLowerCase();
-    const sourceType: CandidateSource["type"] =
-      lower.includes("youtube.com") || lower.includes("youtu.be")
-        ? "video"
-        : lower.includes("twitter.com") || lower.includes("x.com")
-          ? "post"
-          : lower.includes("interview")
-            ? "interview"
-            : "article";
-    return {
-      url: result.url,
-      title: result.title ?? result.url,
-      type: sourceType,
-      publishedAt: result.publishedDate,
-      snippet: result.text?.slice(0, 400),
-    };
-  });
+  for (const q of queries) {
+    const isVideo = q.type === "video";
+    const results = await exaSearch(q.query, {
+      numResults: isVideo ? 5 : 8,
+      text: !isVideo,
+      includeDomains: isVideo
+        ? ["youtube.com", "youtu.be"]
+        : undefined,
+      startPublishedDate: q.dateStart,
+      endPublishedDate: q.dateEnd,
+    });
+
+    if (isVideo) {
+      addResults(
+        results
+          .filter((r) => extractYoutubeId(r.url))
+          .map((r) => ({ ...r, text: `YouTube video: ${r.title ?? ""}` })),
+        "video",
+      );
+    } else {
+      addResults(results);
+    }
+  }
+
+  return all;
+}
+
+/**
+ * Vet sources: use LLM to check which sources are actually about the target person.
+ * Returns only the sources confirmed to be about the right person.
+ */
+async function vetSources(
+  name: string,
+  sources: CandidateSource[],
+  generateJson: (system: string, user: string) => Promise<string>,
+): Promise<CandidateSource[]> {
+  if (sources.length === 0) return [];
+
+  // Batch into groups of 15 for efficient vetting
+  const BATCH = 15;
+  const vetted: CandidateSource[] = [];
+
+  for (let i = 0; i < sources.length; i += BATCH) {
+    const batch = sources.slice(i, i + BATCH);
+    const items = batch.map((s, idx) => ({
+      idx,
+      title: s.title,
+      url: s.url,
+      snippet: (s.snippet ?? "").slice(0, 200),
+    }));
+
+    const resultJson = await generateJson(
+      `You are a source verification agent. Given a target person's name and a list of web sources, determine which sources are genuinely ABOUT that specific person (not someone else with a similar name, not tangentially mentioning them, not about a different person).
+
+Output a JSON object: { "valid": [array of idx numbers that ARE about the target person] }
+
+Be strict:
+- If a title/snippet clearly refers to a DIFFERENT person with the same or similar name, exclude it.
+- If the source seems generic or you can't tell if it's about the right person, exclude it.
+- Only include sources where the title or snippet clearly references the target person in a relevant way.`,
+      JSON.stringify({ targetPerson: name, sources: items }),
+    );
+
+    const parsed = parseJson<{ valid?: number[] }>(resultJson, {});
+    const validSet = new Set(parsed.valid ?? []);
+
+    for (let j = 0; j < batch.length; j++) {
+      if (validSet.has(j)) {
+        vetted.push(batch[j]);
+      }
+    }
+  }
+
+  return vetted;
 }
 
 function fallbackDiscovery(name: string): CandidateSource[] {
@@ -506,115 +632,20 @@ async function fetchYoutubeTranscript(videoId: string): Promise<string> {
   }
 }
 
-/** Deep research per stage using Exa — articles + YouTube videos */
+/**
+ * Deep research per stage: executes LLM-generated search queries for this specific era.
+ */
 async function deepResearchStage(
   name: string,
   stage: StageDoc,
+  searchQueries: Array<{
+    query: string;
+    type: "web" | "video";
+    dateStart?: string;
+    dateEnd?: string;
+  }>,
 ): Promise<CandidateSource[]> {
-  if (!EXA_API_KEY) return [];
-
-  const titleParts = stage.title.replace(/^\[.*?\]\s*-\s*/, "");
-  const allResults: CandidateSource[] = [];
-
-  // ── Search 1: Articles & interviews ──────────
-  const articleQuery = `"${name}" ${titleParts} ${stage.eraSummary.slice(0, 100)}`;
-  try {
-    const response = await fetch("https://api.exa.ai/search", {
-      method: "POST",
-      headers: {
-        "x-api-key": EXA_API_KEY,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        query: articleQuery,
-        numResults: 6,
-        type: "auto",
-        text: true,
-        highlights: true,
-      }),
-    });
-
-    if (response.ok) {
-      const data = (await response.json()) as {
-        results?: Array<{
-          url: string;
-          title?: string;
-          publishedDate?: string;
-          text?: string;
-        }>;
-      };
-
-      for (const result of data.results ?? []) {
-        const lower = result.url.toLowerCase();
-        const sourceType: CandidateSource["type"] =
-          lower.includes("youtube.com") || lower.includes("youtu.be")
-            ? "video"
-            : lower.includes("twitter.com") || lower.includes("x.com")
-              ? "post"
-              : lower.includes("interview")
-                ? "interview"
-                : "article";
-        allResults.push({
-          url: result.url,
-          title: result.title ?? result.url,
-          type: sourceType,
-          publishedAt: result.publishedDate,
-          snippet: result.text?.slice(0, 400),
-        });
-      }
-    }
-  } catch {
-    // Continue to video search even if article search fails
-  }
-
-  // ── Search 2: YouTube videos (interviews, talks, podcasts) ──────────
-  const videoQuery = `${name} interview talk podcast ${titleParts} site:youtube.com`;
-  try {
-    const response = await fetch("https://api.exa.ai/search", {
-      method: "POST",
-      headers: {
-        "x-api-key": EXA_API_KEY,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        query: videoQuery,
-        numResults: 3,
-        type: "auto",
-        text: false,
-      }),
-    });
-
-    if (response.ok) {
-      const data = (await response.json()) as {
-        results?: Array<{
-          url: string;
-          title?: string;
-          publishedDate?: string;
-        }>;
-      };
-
-      for (const result of data.results ?? []) {
-        // Only include actual YouTube video pages (not search results / channels)
-        const ytId = extractYoutubeId(result.url);
-        if (!ytId) continue;
-
-        // Deduplicate against article search results
-        if (allResults.some((r) => r.url === result.url)) continue;
-
-        allResults.push({
-          url: result.url,
-          title: result.title ?? result.url,
-          type: "video" as const,
-          publishedAt: result.publishedDate,
-          snippet: `YouTube video: ${result.title ?? ""}`,
-        });
-      }
-    }
-  } catch {
-    // Non-fatal — we still have article results
-  }
-
-  return allResults;
+  return executeSearchPlan(name, searchQueries);
 }
 
 function parseJson<T>(text: string, fallback: T): T {
@@ -691,6 +722,10 @@ export const runIngestion = action({
       status: "processing",
     });
 
+    // Helper to call LLM from within this action
+    const generateJson = async (system: string, user: string) =>
+      ctx.runAction(api.llm.generateStructuredJson, { system, user });
+
     try {
       await ctx.runMutation(internal.pipeline.upsertJobPhase, {
         personId: args.personId,
@@ -699,14 +734,79 @@ export const runIngestion = action({
         progress: 5,
       });
 
-      let discovered = await discoverWithExa(person.name);
+      // ── Step 1: Ask the LLM to generate smart, persona-aware search queries ──
+      const queryPlanJson = await generateJson(
+        `You are a research agent. Given a person's name, generate a comprehensive set of search queries to discover biographical sources about them.
+
+The person could be ANYONE — a musician, athlete, politician, scientist, actor, entrepreneur, activist, author, etc. Tailor queries to their likely domain.
+
+Output a JSON object: { "queries": [...] }
+
+Each query object has:
+- "query": the search string (use quotes around the person's name for precision)
+- "type": "web" or "video"
+- "dateEnd": optional ISO date string to find older/historical content (e.g. "2010-01-01")
+
+Generate 8-12 queries total. Include:
+1. 2-3 general biography/profile web searches
+2. 2-3 domain-specific web searches (e.g. discography for musicians, match highlights for athletes, policy speeches for politicians)
+3. 2-3 mainstream video searches (interviews, talks, appearances relevant to their field)
+4. 2-3 underground/rare/early video searches (before they were famous, small venues, niche podcasts, campus events, early career footage)
+5. 1 search specifically for OLD content (set dateEnd to filter for historical material)
+
+IMPORTANT: Use the person's full name in quotes in every query for precision.`,
+        JSON.stringify({ personName: person.name }),
+      );
+
+      const queryPlan = parseJson<{
+        queries?: Array<{
+          query: string;
+          type: "web" | "video";
+          dateEnd?: string;
+          dateStart?: string;
+        }>;
+      }>(queryPlanJson, { queries: [] });
+
+      const searchQueries = (queryPlan.queries ?? []).slice(0, 14);
+
+      // If the LLM returned nothing useful, use a minimal fallback
+      if (searchQueries.length === 0) {
+        searchQueries.push(
+          { query: `"${person.name}" biography profile`, type: "web" as const },
+          { query: `"${person.name}" interview`, type: "web" as const },
+          { query: `"${person.name}" interview talk`, type: "video" as const },
+          { query: `"${person.name}" rare early`, type: "video" as const },
+        );
+      }
+
+      await ctx.runMutation(internal.pipeline.upsertJobPhase, {
+        personId: args.personId,
+        phase: "discover",
+        status: "running",
+        progress: 30,
+      });
+
+      // ── Step 2: Execute the search plan via Exa ──
+      let discovered = await executeSearchPlan(person.name, searchQueries);
       if (discovered.length === 0) {
         discovered = fallbackDiscovery(person.name);
       }
 
+      await ctx.runMutation(internal.pipeline.upsertJobPhase, {
+        personId: args.personId,
+        phase: "discover",
+        status: "running",
+        progress: 60,
+      });
+
+      // ── Step 3: Vet sources — filter out wrong-person / irrelevant results ──
+      const vetted = await vetSources(person.name, discovered, generateJson);
+      // Keep at least the fallback results if vetting is too aggressive
+      const finalSources = vetted.length >= 3 ? vetted : discovered;
+
       await ctx.runMutation(internal.pipeline.replaceSources, {
         personId: args.personId,
-        sources: discovered,
+        sources: finalSources,
       });
 
       await ctx.runMutation(internal.pipeline.upsertJobPhase, {
@@ -906,10 +1006,62 @@ export const runIngestion = action({
         progress: 70,
       });
 
-      // ── Deep research per stage ──────────────────────
+      // ── Deep research per stage (LLM-driven queries + vetting) ──────────
       for (let si = 0; si < stages.length; si += 1) {
         const stage = stages[si];
-        const deepSources = await deepResearchStage(person.name, stage);
+
+        // Ask the LLM to generate stage-specific search queries
+        const stageQueryJson = await generateJson(
+          `You are a research agent doing deep research on a specific era of a person's life.
+Given the person's name and a life stage with its title, summary, and turning points, generate targeted search queries to find sources about THIS SPECIFIC ERA.
+
+The person could be anyone — musician, athlete, founder, engineer, politician, scientist, actor, etc. Tailor queries to their domain and this specific period.
+
+Output a JSON object: { "queries": [...] }
+
+Each query object:
+- "query": search string (always include the person's name in quotes)
+- "type": "web" or "video"
+- "dateStart": optional ISO date to filter results from this era
+- "dateEnd": optional ISO date to filter results from this era
+
+Generate 6-8 queries:
+1. 2 web searches for articles/interviews from this era
+2. 2 video searches for mainstream content (talks, performances, matches, appearances)
+3. 2 video searches for rare/underground/early content from this era (niche podcasts, small events, old footage, fan recordings, local news)
+4. 1-2 queries targeting specific turning points or key moments from this stage`,
+          JSON.stringify({
+            personName: person.name,
+            stageTitle: stage.title,
+            eraSummary: stage.eraSummary,
+            turningPoints: stage.turningPoints,
+            dateStart: stage.dateStart,
+            dateEnd: stage.dateEnd,
+          }),
+        );
+
+        const stageQueryPlan = parseJson<{
+          queries?: Array<{
+            query: string;
+            type: "web" | "video";
+            dateStart?: string;
+            dateEnd?: string;
+          }>;
+        }>(stageQueryJson, { queries: [] });
+
+        const stageSearchQueries = (stageQueryPlan.queries ?? []).slice(0, 10);
+
+        let deepSources = await deepResearchStage(
+          person.name,
+          stage,
+          stageSearchQueries,
+        );
+
+        // Vet deep research sources for relevance
+        if (deepSources.length > 0) {
+          deepSources = await vetSources(person.name, deepSources, generateJson);
+        }
+
         if (deepSources.length > 0) {
           // Add new sources (avoiding duplicates)
           await ctx.runMutation(internal.pipeline.addSources, {
