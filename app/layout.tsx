@@ -18,6 +18,10 @@ const body = IBM_Plex_Sans({
 export const metadata: Metadata = {
   title: "LORE — Interactive Biography Engine",
   description: "Deep-research biography timelines with era-specific chat. Enter any name and explore their life story.",
+  icons: {
+    icon: "/favicon.png",
+    apple: "/favicon.png",
+  },
 };
 
 export default function RootLayout({

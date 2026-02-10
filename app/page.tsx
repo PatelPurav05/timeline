@@ -2,6 +2,7 @@
 
 import { FormEvent, useMemo, useState } from "react";
 import Link from "next/link";
+import Image from "next/image";
 import { useRouter } from "next/navigation";
 import { useMutation, useQuery } from "convex/react";
 import { api } from "@/convex/_generated/api";
@@ -112,8 +113,14 @@ export default function HomePage() {
             transition={{ duration: 0.3, ease: "easeOut" }}
             className="mb-8 flex items-end gap-3"
           >
-            <h2 className="text-5xl tracking-tight">LORE</h2>
-            <div className="-ml-1.5 mb-1.5 h-1.5 w-1.5 rounded-full bg-[var(--accent)]" />
+            <Image
+              src="/lore-logo.png"
+              alt="LORE"
+              width={160}
+              height={48}
+              className="h-12 w-auto"
+              priority
+            />
           </motion.div>
 
           <div className="grid gap-8 lg:grid-cols-[1.15fr_0.85fr]">
@@ -327,10 +334,13 @@ export default function HomePage() {
       {/* ── Footer ────────────────────────────────── */}
       <footer className="border-t-3 border-[var(--frame)] px-5 py-6 sm:px-8 lg:px-12">
         <div className="mx-auto flex max-w-6xl items-center justify-between">
-          <div className="flex items-end gap-2">
-            <p className="text-xl tracking-tight">LORE</p>
-            <div className="-ml-1 mb-1 h-1 w-1 rounded-full bg-[var(--accent)]" />
-          </div>
+          <Image
+            src="/lore-logo.png"
+            alt="LORE"
+            width={80}
+            height={24}
+            className="h-6 w-auto"
+          />
           <p className="text-xs text-[var(--muted)]">
             Built with Next.js, Convex, OpenAI, and Exa
           </p>
